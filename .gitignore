@@ -1,0 +1,20 @@
+dashboard/
+v23/
+.claude/
+.vscode/
+
+# Секреты и данные
+v231/config.py
+v231/farm_data_v2.db
+v231/inner.lua
+v231/src/
+v231/sessions_log.txt
+
+# Обфускаторы
+v231/IronBrew2/
+v231/Prometheus/
+v231/Prometheus2/
+
+# Кэш
+__pycache__/
+*.pyc
