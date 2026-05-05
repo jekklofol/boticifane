@@ -500,14 +500,17 @@ local httprequest = (syn and syn.request) or http and http.request or http_reque
 local queueFunc = queueonteleport or queue_on_teleport or (syn and syn.queue_on_teleport) or function() log("[HOP] Queue not supported!") end
 
 -- ==================== SINGLETON GUARD ====================
--- Root cause of duplicates: queueFunc() was called multiple times per hop
--- (from main loop + watchdog firing simultaneously), so N hops = N scripts on next server.
--- Fix:
---   1. queueFunc is only allowed ONCE per Roblox session (PD_HAS_QUEUED flag)
---   2. Singleton with stagger so simultaneous starts resolve to exactly 1 winner
-local myInstanceId = tick()
+-- Защита от двух источников дублей:
+--   1. queueFunc() мог вызваться несколько раз за hop (main + watchdog).
+--      Решение: PD_HAS_QUEUED — queueFunc срабатывает максимум 1 раз за Roblox-сессию.
+--   2. Юзер инжектит скрипт повторно (рукой через executor).
+--      Решение: heartbeat — активный instance каждую секунду обновляет PD_HEARTBEAT.
+--      Новый инжект видит свежий heartbeat (<HEARTBEAT_DEAD_AFTER) и тихо выходит.
+--      Если предыдущий instance умер (crash/teleport без queue) — heartbeat протухнет,
+--      новый инжект захватит контроль.
+local myInstanceId = tick() + math.random()  -- + random чтобы tick-collision были невозможны
+local HEARTBEAT_DEAD_AFTER = 4  -- секунд: если PD_HEARTBEAT старше — старый instance считается мёртвым
 
--- Wrap queueFunc so it can only fire ONCE per Roblox session
 local _rawQueueFunc = queueFunc
 queueFunc = function(code)
     if getgenv and getgenv().PD_HAS_QUEUED then
@@ -519,30 +522,39 @@ queueFunc = function(code)
 end
 
 if getgenv then
-    -- Reset queue flag for this new server session
-    getgenv().PD_HAS_QUEUED = false
-
     local prevId = getgenv().PD_RUNNING_ID
+    local prevHB = getgenv().PD_HEARTBEAT or 0
+    local age = tick() - prevHB
+    if prevId and prevId ~= 0 and age < HEARTBEAT_DEAD_AFTER then
+        log(string.format(
+            "[SINGLETON] Active instance %s alive (heartbeat %.1fs ago) — this re-inject is a no-op",
+            tostring(prevId), age))
+        return  -- тихо выходим, не трогаем глобалы
+    end
     if prevId and prevId ~= 0 then
-        log("[SINGLETON] Replacing previous instance " .. tostring(prevId))
+        log(string.format("[SINGLETON] Previous instance %s stale (%.1fs old) — taking over",
+            tostring(prevId), age))
     end
     getgenv().PD_RUNNING_ID = myInstanceId
-
-    -- Stagger: give other simultaneous instances a moment to also set their ID,
-    -- then re-check — the last one to set wins and all others exit their loops
-    task.wait(0.05 + math.random() * 0.15)
-    if getgenv().PD_RUNNING_ID ~= myInstanceId then
-        -- Lost the race — another instance started after us, let it run
-        log("[SINGLETON] Lost startup race — exiting (another instance is running)")
-        return  -- stops this script execution entirely
-    end
-    log("[SINGLETON] Won startup race — this is the active instance (id=" .. myInstanceId .. ")")
+    getgenv().PD_HEARTBEAT = tick()
+    getgenv().PD_HAS_QUEUED = false
+    log("[SINGLETON] Active instance id=" .. tostring(myInstanceId))
 end
 
 local function isActiveInstance()
     if not getgenv then return true end
     return getgenv().PD_RUNNING_ID == myInstanceId
 end
+
+-- Heartbeat: пока этот instance активен, обновляем PD_HEARTBEAT. Если скрипт зависнет
+-- или будет убит — heartbeat протухнет за HEARTBEAT_DEAD_AFTER, и следующий инжект
+-- сможет взять контроль.
+task.spawn(function()
+    while isActiveInstance() do
+        if getgenv then getgenv().PD_HEARTBEAT = tick() end
+        task.wait(1)
+    end
+end)
 
 -- ==================== VISITED SERVERS (persistent across hops) ====================
 local VISITED_FOLDER = "ServerHop"
@@ -1796,8 +1808,12 @@ local function verifyClaim(boothLocation, boothNum)
     if not details then return false end
     local owner = details:FindFirstChild("Owner")
     if not owner then return false end
-    local ownerText = owner.Text
-    return string.find(ownerText, player.DisplayName) ~= nil or string.find(ownerText, player.Name) ~= nil
+    local ownerText = tostring(owner.Text or "")
+    -- plain=true: имя может содержать Lua-pattern символы (. ( ) [ ] - + * ? ^ $ %)
+    -- из-за чего поиск без plain=true мог ложно говорить "claim не прошёл" и
+    -- приводить к бесконечной попытке re-claim уже взятой стойки.
+    return string.find(ownerText, tostring(player.DisplayName or ""), 1, true) ~= nil
+        or string.find(ownerText, tostring(player.Name or ""), 1, true) ~= nil
 end
 
 local function walkRandomDirection(studs, waitTime)
@@ -1913,6 +1929,10 @@ local BOOTH_CLAIM_DEADLINE = nil  -- set on first call
 
 local function claimBooth(retryCount)
     retryCount = retryCount or 0
+    if not isActiveInstance() then
+        log("[BOOTH] Не активный instance — выходим из claimBooth")
+        return nil
+    end
     -- Global deadline: max 180s total for booth claiming across all retries
     if retryCount == 0 then BOOTH_CLAIM_DEADLINE = tick() + 180 end
     if BOOTH_CLAIM_DEADLINE and tick() > BOOTH_CLAIM_DEADLINE then
@@ -1970,13 +1990,17 @@ local function claimBooth(retryCount)
     
     -- Try each booth one by one
     for i, booth in ipairs(unclaimed) do
+        if not isActiveInstance() then
+            log("[BOOTH] Lost active flag mid-loop — abort claim")
+            return nil
+        end
         -- Before trying another booth: if we already own one, stop and use it (don't claim a second)
         local alreadyOwn = findOwnedBooth(boothLocation)
         if alreadyOwn then
             log("[BOOTH] Already own a booth — stopping, not claiming another")
             return alreadyOwn
         end
-        
+
         -- Check deadline on every booth attempt
         if BOOTH_CLAIM_DEADLINE and tick() > BOOTH_CLAIM_DEADLINE then
             log("[BOOTH] ⏰ Deadline hit mid-loop — aborting, will hop")
