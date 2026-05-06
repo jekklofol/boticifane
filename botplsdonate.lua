@@ -394,7 +394,7 @@ local STUCK_CHECK_TIME  = 4
 local MAX_JUMP_TRIES    = 3
 local JUMP_DURATION     = 0.8
 local MAX_RANDOM_TRIES  = 5
-local MAX_STUCK_BEFORE_HOP = 3                         -- Server hop if stuck 3 times in a row
+local MAX_STUCK_BEFORE_HOP = math.random(4, 7)         -- Random per session; predictable "hop after 3 stucks" is a flagged pattern
 local SPRINT_KEY        = Enum.KeyCode.LeftShift
 
 -- Track consecutive stuck failures
@@ -714,6 +714,46 @@ task.spawn(function()
     end
 end)
 log("[AFK] Anti-AFK running (VirtualUser, 3-min interval)")
+
+-- ==================== HUMAN-LOOK: camera + idle wander ====================
+-- Real players constantly nudge their camera and wiggle. Bots that stand
+-- frozen looking the same direction stand out hard to manual moderators.
+task.spawn(function()
+    task.wait(math.random(8, 25))
+    while true do
+        local cam = workspace.CurrentCamera
+        if cam then
+            pcall(function()
+                local yaw   = math.rad((math.random() - 0.5) * 30)  -- ±15°
+                local pitch = math.rad((math.random() - 0.5) * 10)  -- ±5°
+                cam.CFrame = cam.CFrame * CFrame.Angles(pitch, yaw, 0)
+            end)
+        end
+        task.wait(math.random(7, 28))
+    end
+end)
+
+-- Background passive wander: occasional WASD twitch so the avatar isn't
+-- a frozen statue between begging cycles. Mouse-jiggle isn't replicated
+-- by Roblox, but humanoid keyboard input is.
+local _WANDER_KEYS = {Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D}
+task.spawn(function()
+    task.wait(math.random(45, 150))
+    while true do
+        pcall(function()
+            -- Skip while bot is actively chasing/begging; only twitch when idle
+            local timeSinceBeg = tick() - lastBeggingTime
+            if timeSinceBeg > 12 then
+                local key = _WANDER_KEYS[math.random(#_WANDER_KEYS)]
+                local dur = 0.15 + math.random() * 0.45
+                VirtualInputManager:SendKeyEvent(true,  key, false, game)
+                task.wait(dur)
+                VirtualInputManager:SendKeyEvent(false, key, false, game)
+            end
+        end)
+        task.wait(math.random(25, 90))
+    end
+end)
 
 -- ==================== AUTO-RECONNECT QUEUE: Error 277 recovery ====================
 -- Error 277 = lost connection / network drop.
@@ -2444,7 +2484,144 @@ local function faceTargetBriefly(t)
     hrp.CFrame = CFrame.new(hrp.Position, look)
 end
 
+-- ==================== PERSONALITY (deterministic by UserId) ====================
+-- Each account gets a stable "personality" that controls chat style, intervals, etc.
+-- This is THE main anti-detect lever: 50 bots stop looking like 50 clones.
+local PERSONA = (function()
+    local seed = 0
+    local uid  = tostring(player.UserId or "0")
+    for i = 1, #uid do seed = (seed * 31 + string.byte(uid, i)) % 2147483647 end
+    local rng = Random.new(seed)
+    local function r(lo, hi) return lo + rng:NextNumber() * (hi - lo) end
+    return {
+        chat_speed_mult       = r(0.7, 1.5),    -- typing-delay multiplier
+        emoji_chance          = r(0.05, 0.35),  -- chance to add emoji
+        typo_chance           = r(0.04, 0.16),  -- chance to introduce typo
+        cap_drop_chance       = r(0.10, 0.40),  -- chance to lowercase msg
+        punc_drop_chance      = r(0.20, 0.55),  -- chance to drop terminal !?.
+        ellipsis_chance       = r(0.05, 0.20),  -- chance to add ... at end
+        mention_resp_chance   = r(0.85, 0.95),  -- ~5-15% silently ignored per-bot
+        mention_min_delay     = r(0.8, 1.8),    -- short, still slower than 0.4s tell
+        mention_max_delay     = r(2.5, 4.5),
+        silence_period_min    = r(55 * 60, 80 * 60),   -- rare: 55-80 min floor
+        silence_period_max    = r(95 * 60, 130 * 60),  -- 95-130 min ceiling
+        silence_dur_min       = r(60, 120),     -- short break: 1-2 min floor
+        silence_dur_max       = r(150, 240),    -- 2.5-4 min ceiling
+        prefer_short          = rng:NextNumber() < 0.5,
+        seed                  = seed,
+    }
+end)()
+
+-- ==================== SILENT MODE (random AFK windows) ====================
+-- Real humans don't beg every 10 seconds for hours. Bot goes silent for several
+-- minutes, randomly. While silent: chat is dropped, idle wander runs, that's it.
+local SILENT_MODE = false
+task.spawn(function()
+    -- Initial wait so bots don't all silence at the same script-startup mark
+    task.wait(math.random(120, 600))
+    while true do
+        local activeFor = math.random(
+            math.floor(PERSONA.silence_period_min),
+            math.floor(PERSONA.silence_period_max))
+        task.wait(activeFor)
+        local silentFor = math.random(
+            math.floor(PERSONA.silence_dur_min),
+            math.floor(PERSONA.silence_dur_max))
+        SILENT_MODE = true
+        task.wait(silentFor)
+        SILENT_MODE = false
+    end
+end)
+
+-- ==================== HUMANIZER ====================
+-- Mutates outgoing chat: random typos, capitalisation, punctuation, emoji.
+-- Each bot's mutation rates are pinned to PERSONA so it stays consistent
+-- per-account (a bot that drops emojis isn't suddenly emoji-spamming).
+local CHAT_EMOJIS = {":)", ":D", " :)", " :D", " lol", " ngl", " fr", " :(", " 😭", " 🥺", " ✨", ""}
+local NEAR_KEY = {
+    a = "sq", s = "ad", d = "sf", f = "dg", g = "fh", h = "gj", j = "hk",
+    k = "jl", l = "k", q = "wa", w = "qe", e = "wr", r = "et", t = "ry",
+    y = "tu", u = "yi", i = "uo", o = "ip", p = "ol", z = "x", x = "zc",
+    c = "xv", v = "cb", b = "vn", n = "bm", m = "n",
+}
+
+local function maybeTypo(s)
+    if math.random() >= PERSONA.typo_chance then return s end
+    if #s < 4 then return s end
+    -- pick a random alpha char and either swap with neighbour, drop a letter,
+    -- or replace with adjacent key
+    local chars = {}
+    for i = 1, #s do chars[i] = s:sub(i, i) end
+    local idx = math.random(2, #chars - 1)
+    local roll = math.random(3)
+    if roll == 1 then
+        -- swap with next
+        chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
+    elseif roll == 2 then
+        -- drop one letter
+        table.remove(chars, idx)
+    else
+        -- replace with adjacent qwerty key
+        local lower = chars[idx]:lower()
+        local repl  = NEAR_KEY[lower]
+        if repl then
+            local newCh = repl:sub(math.random(#repl), math.random(#repl))
+            if chars[idx]:match("[A-Z]") then newCh = newCh:upper() end
+            chars[idx] = newCh
+        end
+    end
+    return table.concat(chars)
+end
+
+local function maybeLower(s)
+    if math.random() < PERSONA.cap_drop_chance then return s:lower() end
+    return s
+end
+
+local function maybeDropPunc(s)
+    if math.random() < PERSONA.punc_drop_chance then
+        return (s:gsub("[%.!%?]+%s*$", ""))
+    end
+    return s
+end
+
+local function maybeEllipsis(s)
+    if math.random() < PERSONA.ellipsis_chance then
+        if not s:match("[%.!%?]$") and not s:match("%.%.%.$") then
+            return s .. "..."
+        end
+    end
+    return s
+end
+
+local function maybeEmoji(s)
+    if math.random() < PERSONA.emoji_chance then
+        local e = CHAT_EMOJIS[math.random(#CHAT_EMOJIS)]
+        if e ~= "" and not s:find(e:gsub("^%s+", ""), 1, true) then
+            return s .. e
+        end
+    end
+    return s
+end
+
+local function humanize(msg)
+    if type(msg) ~= "string" or msg == "" then return msg end
+    local out = msg
+    out = maybeTypo(out)
+    out = maybeLower(out)
+    out = maybeDropPunc(out)
+    out = maybeEllipsis(out)
+    out = maybeEmoji(out)
+    -- Trim trailing/leading spaces that may have been introduced
+    out = out:gsub("^%s+", ""):gsub("%s+$", "")
+    if out == "" then return msg end
+    return out
+end
+
 local function sendChat(msg)
+    -- Drop chat during silence windows (bot stays in-game but quiet)
+    if SILENT_MODE then return end
+    msg = humanize(msg)
     -- Make chat non-blocking to prevent hangs from SendAsync
     task.spawn(function()
         if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
@@ -2466,6 +2643,7 @@ end
 
 -- Send chat with typing delay (simulates human typing speed)
 local function sendChatTyped(msg)
+    if SILENT_MODE then return end
     local words = countWords(msg)
     local delay
     if words <= 3 then
@@ -2475,6 +2653,8 @@ local function sendChatTyped(msg)
     else
         delay = math.random() * 1.0 + 2.0   -- 2.0–3.0s
     end
+    -- per-bot speed: some bots type faster, some slower
+    delay = delay * PERSONA.chat_speed_mult
     task.wait(delay)
     sendChat(msg)
 end
@@ -2498,38 +2678,75 @@ end
 local mentionQueue   = {}  -- { [userId] = true }
 local mentionReplyCd = {}  -- { [userId] = tick() } per-player cooldown
 
-local MENTION_REPLIES = {
-    "yeah?",
-    "hi!",
-    "yes?",
-    "hey!",
-    "what's up",
-    "yea?",
-    "u called?",
-    "yeah what's up",
-    "oh hey!",
+-- Big pool of varied replies. Splits intentionally short/medium/long so the
+-- distribution of reply lengths varies between accounts (PERSONA.prefer_short).
+local MENTION_REPLIES_SHORT = {
+    "yeah?", "hi!", "yes?", "hey!", "yea?", "yo", "huh?", "ya?",
+    "sup", "hm?", "?", "yh?", "what", "hii", "hey hey",
 }
+local MENTION_REPLIES_MED = {
+    "u called?", "what's up", "yeah what's up", "oh hey!", "yes?",
+    "you talking to me?", "wsg", "u talking to me?", "im here",
+    "what u need", "yeah you", "huh whats up", "yo yes", "im listening",
+    "whats good", "you say something?",
+}
+local MENTION_REPLIES_LONG = {
+    "yeah whats up lol", "oh hi yeah whats good", "you talkin to me lol",
+    "yeah im here whats up", "huh you said my name?",
+    "wait did u call me lol", "yeah whats good", "oh me? whats up",
+    "hi yeah?", "im here lol whats up",
+}
+
+local function pickMentionReply()
+    local pools
+    if PERSONA.prefer_short then
+        pools = { MENTION_REPLIES_SHORT, MENTION_REPLIES_SHORT, MENTION_REPLIES_MED }
+    else
+        pools = { MENTION_REPLIES_MED, MENTION_REPLIES_LONG, MENTION_REPLIES_SHORT }
+    end
+    local pool = pools[math.random(#pools)]
+    return pool[math.random(#pool)]
+end
 
 local function onMentioned(speakerName)
     if speakerName == player.Name then return end
+    if SILENT_MODE then return end
     local mentioned = nil
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Name == speakerName then mentioned = p; break end
     end
     if not mentioned then return end
     local uid = mentioned.UserId
-    -- 30s per-player cooldown so bot doesn't spam replies
+    -- Per-player cooldown, randomised so two consecutive mentions don't trigger
+    -- exactly 30.0s apart (a tell-tale machine number).
     local now = tick()
-    if mentionReplyCd[uid] and now - mentionReplyCd[uid] < 30 then return end
+    local cdLimit = 25 + math.random() * 20  -- 25-45s
+    if mentionReplyCd[uid] and now - mentionReplyCd[uid] < cdLimit then return end
     mentionReplyCd[uid] = now
+
+    -- Small chance to silently ignore (5-15% per-bot). Real players occasionally
+    -- miss a mention or just don't respond. Bots that ALWAYS answer = pattern.
+    if math.random() > PERSONA.mention_resp_chance then
+        log("[MENTION] " .. speakerName .. " — skipping reply (rare ignore)")
+        -- Still queue for approach so the lead isn't wasted
+        mentionQueue[uid] = true
+        ignoreList[uid]   = nil
+        return
+    end
+
     -- Prioritise this player for next approach
     mentionQueue[uid] = true
-    ignoreList[uid]   = nil  -- remove from ignore if they were there
-    log("[MENTION] " .. speakerName .. " mentioned bot — queued for priority approach")
-    -- Quick natural reply with short random delay (looks human)
+    ignoreList[uid]   = nil
+    log("[MENTION] " .. speakerName .. " mentioned bot — queued + replying")
+
+    -- Short, still-randomised delay (~1-4s). Instant 0.4s replies look bot-like;
+    -- 1-4s reads as "saw it on screen, typed a quick reply" — natural enough.
     task.spawn(function()
-        task.wait(math.random() * 1.0 + 0.4)
-        sendChat(MENTION_REPLIES[math.random(#MENTION_REPLIES)])
+        local d = math.random() * (PERSONA.mention_max_delay - PERSONA.mention_min_delay)
+                + PERSONA.mention_min_delay
+        task.wait(d)
+        if SILENT_MODE then return end
+        sendChat(pickMentionReply())
     end)
 end
 
@@ -2579,7 +2796,15 @@ local function findClosest()
 end
 
 -- ========= MESSAGE WITH TYPO CHANCE =========
+-- Forward decl: real definition is in BEG PHRASE COMBINATOR section below.
+local genBegPhrase
 local function getRandomMessage()
+    -- 50% generated on the fly via combinator (unique strings every time),
+    -- 50% from the static MESSAGES pool (with original typo variants).
+    if math.random() < 0.5 then
+        local cats = {"empty", "low", "mid", "rich"}
+        return genBegPhrase(cats[math.random(#cats)])
+    end
     local msgIndex = math.random(#MESSAGES)
     if math.random() < TYPO_CHANCE then
         if msgIndex <= #MESSAGE_TYPOS then
@@ -2634,6 +2859,66 @@ local function getMsgCategory(raised)
     return "rich"
 end
 
+-- ==================== BEG PHRASE COMBINATOR ====================
+-- Built fresh each call from small word-list parts. Keeps the wire
+-- distribution of strings huge so detectors that hash full phrases
+-- against known-bot pools see a constant churn of unseen lines.
+local _gen_open = {
+    empty = {"hey", "hi", "yo", "umm", "hmm", "psst", "hii", "ay", "heyy"},
+    low   = {"hey", "hi", "yo", "bro", "dude", "ay"},
+    mid   = {"yo", "hey", "hi", "ngl"},
+    rich  = {"yo", "ngl", "damn", "wow", "ok"},
+}
+local _gen_hook = {
+    empty = {
+        "im just starting", "got nothing yet", "im so broke",
+        "0 raised rn", "literally 0 r$", "no donations yet",
+        "tryna start", "i need r$", "im new",
+    },
+    low   = {
+        "we both grinding", "we both low", "we tryna save",
+        "we both startin", "we in the same boat", "i need a boost",
+        "tryna catch up", "small goal pls",
+    },
+    mid   = {
+        "u doing well", "ur booth lookin good", "u got donations",
+        "u know the grind", "u got some saved",
+    },
+    rich  = {
+        "ur rich", "u loaded", "ur booth doing great",
+        "u got heaps", "ur raised insane", "u got so much",
+    },
+}
+local _gen_ask = {
+    "donate?", "donate pls", "spare some?", "help me out?",
+    "any robux?", "share some?", "donate ty", "donate plz",
+    "could u donate?", "spare a lil?", "donate pls?",
+    "any donation works", "even 5 r$ helps", "help?",
+}
+local _gen_tail = {
+    "", "", "", "lol", "ty", "fr", "pls", "ngl", ":)", "lmao", "tysm",
+}
+
+local function _pick(t) return t[math.random(#t)] end
+
+genBegPhrase = function(cat)
+    local opens = _gen_open[cat] or _gen_open.empty
+    local hooks = _gen_hook[cat] or _gen_hook.empty
+    local parts = {}
+    -- 60% include opener
+    if math.random() < 0.6 then table.insert(parts, _pick(opens)) end
+    -- 75% include hook
+    if math.random() < 0.75 then table.insert(parts, _pick(hooks)) end
+    -- always include the ask
+    table.insert(parts, _pick(_gen_ask))
+    -- 40% include tail
+    if math.random() < 0.4 then
+        local t = _pick(_gen_tail)
+        if t ~= "" then table.insert(parts, t) end
+    end
+    return table.concat(parts, " ")
+end
+
 -- 35% chance to include player's name in message (varied prefixes)
 local function addName(msg, t)
     if math.random(20) <= 7 then
@@ -2673,7 +2958,13 @@ local function getFirstMsg(t)
         }
         base = dreamLines[math.random(#dreamLines)]
     else
-        base = pool[math.random(#pool)]
+        -- Mix combinator with fixed pool — half the lines are unique generated
+        -- strings so detectors that signature on the public pool see a moving target.
+        if math.random() < 0.5 then
+            base = genBegPhrase(cat)
+        else
+            base = pool[math.random(#pool)]
+        end
     end
 
     return addName(base, t)
@@ -3356,18 +3647,21 @@ end
 monitorDonations()
 startReporting()
 
--- ── Watchdog: if bot hasn't actually begged in 3 minutes, force server hop ──
--- At 90s idle → enable leavingSoon messages; at 180s → force hop.
+-- ── Watchdog: if bot hasn't actually begged in N minutes, force server hop ──
+-- Hop interval randomised per-bot (8-15 min) so 50 bots aren't all hopping
+-- on the same 3-minute clock — that pattern shows up in the game telemetry.
 task.spawn(function()
-    local BEG_IDLE_LIMIT = 180
+    local BEG_IDLE_LIMIT  = math.random(240, 420)  -- 4-7 min, randomised
+    local LEAVING_WARN_AT = BEG_IDLE_LIMIT - math.random(45, 90)
+    log(string.format("[WATCHDOG] Hop after %ds idle (warn at %ds)", BEG_IDLE_LIMIT, LEAVING_WARN_AT))
     task.wait(60)
     while isActiveInstance() do
         task.wait(30)
         if not isActiveInstance() then break end
         local sinceLastBeg = tick() - lastBeggingTime
-        if sinceLastBeg > 90 and not leavingSoon then
+        if sinceLastBeg > LEAVING_WARN_AT and not leavingSoon then
             leavingSoon = true
-            log("[WATCHDOG] Idle 90s — leavingSoon enabled")
+            log(string.format("[WATCHDOG] Idle %.0fs — leavingSoon enabled", sinceLastBeg))
         end
         if sinceLastBeg > BEG_IDLE_LIMIT then
             leavingSoon = false
