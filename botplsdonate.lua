@@ -422,7 +422,39 @@ local Stats = {
     robux_gross     = 0,   -- total R$ raised (before Roblox 40% cut)
     raised_current  = 0,   -- current absolute Raised value shown on our booth
 }
-local sessionStart = os.time()  -- Unix epoch so dashboard timestamps are correct
+-- ==================== SESSION START (persists across hops) ====================
+-- The user wants "when did I turn the bot on", not "when did this Roblox session
+-- begin". Without persistence each server-hop reloads the script, resets os.time()
+-- here, and the dashboard sees a brand-new "start" every few minutes.
+--
+-- We persist sessionStart via writefile/readfile so it survives:
+--   • server hops (queueonteleport reloads the script)
+--   • Error 277 reconnects
+--   • teleport-back-to-Pls-Donate after a kick
+--
+-- Reset only when the file is missing (= bot was truly stopped & restarted).
+local sessionStart
+do
+    local SAVE_PATH = "PD_SessionStart.txt"
+    local _readfile  = rawget(getfenv(), "readfile")  or (syn and syn.readfile)
+    local _writefile = rawget(getfenv(), "writefile") or (syn and syn.writefile)
+    local _isfile    = rawget(getfenv(), "isfile")
+    local saved
+    if _readfile and (_isfile == nil or pcall(_isfile, SAVE_PATH)) then
+        local ok, content = pcall(_readfile, SAVE_PATH)
+        if ok and content then
+            saved = tonumber(tostring(content):match("%d+"))
+        end
+    end
+    -- Sanity: file must be a plausible Unix timestamp (year > 2020 and not in future)
+    local nowEpoch = os.time()
+    if saved and saved > 1577836800 and saved <= nowEpoch + 60 then
+        sessionStart = saved
+    else
+        sessionStart = nowEpoch
+        if _writefile then pcall(_writefile, SAVE_PATH, tostring(sessionStart)) end
+    end
+end
 
 -- getNeeded() must be AFTER Stats (upvalue lookup at definition time in Lua)
 local function getNeeded()
