@@ -14,7 +14,6 @@ from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    BufferedInputFile,
 )
 import db_v2
 from config import BOT_TOKEN, ADMIN_TG_ID, TG_CHANNEL_URL, API_BASE_URL
@@ -79,6 +78,14 @@ def _check_rate(tg_id: int, is_callback: bool = False) -> bool:
     if len(dq) >= limit:
         return False
     dq.append(now)
+    # Periodic cleanup: when dict grows large, drop empty deques
+    if len(_rl_store) > 5000:
+        for k in list(_rl_store.keys()):
+            d = _rl_store[k]
+            while d and now - d[0] > max(_RL_WINDOW, _RL_CB_WINDOW) * 2:
+                d.popleft()
+            if not d:
+                del _rl_store[k]
     return True
 
 
@@ -1016,27 +1023,16 @@ async def cmd_getscript(msg: Message):
             await msg.answer("❌ У тебя нет активного ключа. Напиши /start.")
         return
 
-    # Prefer obfuscated loader; fall back to source if not built yet
-    loader_path = os.path.join(os.path.dirname(__file__), "loader_v2_obf.lua")
-    if not os.path.exists(loader_path):
-        loader_path = os.path.join(os.path.dirname(__file__), "loader_v2.lua")
-    if not os.path.exists(loader_path):
-        await msg.answer("⚠️ Файл скрипта не найден. Обратись к администратору.")
-        return
+    loadstring_url = API_BASE_URL.rstrip("/") + "/loader.lua"
+    one_liner = f'loadstring(game:HttpGet("{loadstring_url}"))()'
 
-    with open(loader_path, "rb") as f:
-        data = f.read()
-
-    await msg.answer_document(
-        BufferedInputFile(data, filename="loader.lua"),
-        caption=(
-            "📜 <b>Скрипт для инжектора</b>\n\n"
-            "1. Скачай файл\n"
-            "2. Открой в инжекторе (Xeno, Solara, Delta...)\n"
-            "3. Зайди в <b>Please Donate</b> и инжектируй\n"
-            "4. Введи ключ из /mykey\n\n"
-            "🔑 Ключ — твой личный. Не передавай его другим."
-        ),
+    await msg.answer(
+        "📜 <b>Скрипт для инжектора</b>\n\n"
+        "1. Скопируй строку ниже\n"
+        "2. Вставь в инжектор (Xeno, Solara, Delta...) и нажми <b>Execute</b>\n"
+        "3. В открывшемся окне введи ключ из /mykey\n\n"
+        f"<code>{one_liner}</code>\n\n"
+        "🔑 Ключ — твой личный. Не передавай его другим.",
         parse_mode="HTML",
     )
 
@@ -1834,6 +1830,285 @@ async def main():
 
     print(f"[bot] Запуск... @{_bot_username}")
     await dp.start_polling(bot)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAMIFICATION commands: /profile /top /level /setnick
+# ══════════════════════════════════════════════════════════════════════════════
+
+from aiogram.types import WebAppInfo
+
+MINIAPP_URL = API_BASE_URL.rstrip("/") + "/miniapp"
+
+def _bar(pct: int, length: int = 10) -> str:
+    filled = round(pct / 100 * length)
+    return "█" * filled + "░" * (length - filled)
+
+
+@dp.message(Command("profile", "stats"))
+async def cmd_profile(msg: Message):
+    tg_id = msg.from_user.id
+    await msg.answer("⏳ Загружаю профиль...")
+    try:
+        p = db_v2.get_webapp_profile(tg_id=tg_id)
+        if not p:
+            await msg.answer("❌ У тебя нет активной лицензии.")
+            return
+
+        stars = "⭐" * min(5, p["level"] // 4 + 1)
+        bar = _bar(p["progress_pct"])
+
+        text = (
+            f"╔══ 👤 <b>{p['display_name']}</b> ══╗\n\n"
+            f"  {p['tier_emoji']} <b>Lv {p['level']}</b> — {p['tier']}\n"
+            f"  {bar} {p['progress_pct']}%\n"
+            f"  до Lv {p['level']+1}: ещё <b>{p['xp_needed']-p['xp_in_level']} R$</b>\n\n"
+            f"💰 <b>{p['total_robux']:,}</b> R$ всего\n"
+            f"📅 Эта неделя: <b>{p['week_robux']:,}</b> R$\n"
+            f"🎯 Донатов: <b>{p['total_donations']:,}</b> · Конверсия: <b>{p['conversion_pct']}%</b>\n"
+            f"🎮 Сессий: <b>{p['sessions_count']}</b> · Лучшая: <b>{p['best_session']:,}</b> R$\n"
+        )
+        if p["week_rank"] > 0:
+            text += f"\n🏆 Место на неделе: <b>#{p['week_rank']}</b>\n"
+        if p["bonus_robux"] > 0:
+            text += f"🎁 Бонус R$: <b>+{p['bonus_robux']}</b>\n"
+        text += f"\n╚{'═'*20}╝"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🌐 Открыть профиль", web_app=WebAppInfo(url=MINIAPP_URL)),
+        ]])
+        await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        await msg.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("top"))
+async def cmd_top(msg: Message):
+    rows = db_v2.get_weekly_leaderboard(limit=10)
+    if not rows:
+        await msg.answer("📭 Топ пока пуст — никто не фармил на этой неделе.")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for r in rows[:10]:
+        medal = medals[r["rank_pos"] - 1] if r["rank_pos"] <= 3 else f"#{r['rank_pos']}"
+        lines.append(f"{medal} <b>{r['display_name']}</b> — {r['robux_week']:,} R$")
+
+    prizes = "🎁 Призы: Топ-1 +100 R$, Топ 2–5 +25 R$ каждому"
+    week_ends = db_v2.get_week_start() + 7 * 86400
+    import datetime
+    ends_str = datetime.datetime.utcfromtimestamp(week_ends).strftime("%d.%m %H:%M UTC")
+    text = (
+        f"🏆 <b>Топ фармеров недели</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\n{prizes}\n"
+        f"⏰ Сброс: <b>{ends_str}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📊 Полный топ", web_app=WebAppInfo(url=MINIAPP_URL + "#leaderboard")),
+    ]])
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.message(Command("level"))
+async def cmd_level(msg: Message):
+    tg_id = msg.from_user.id
+    p = db_v2.get_webapp_profile(tg_id=tg_id)
+    if not p:
+        await msg.answer("❌ У тебя нет активной лицензии.")
+        return
+    tiers = db_v2.get_all_tiers()
+    cur_tier = next((t for t in tiers if t["min_level"] <= p["level"] <= t["max_level"]), None)
+    next_tier = next((t for t in tiers if t["min_level"] > p["level"]), None)
+    bar = _bar(p["progress_pct"])
+    text = (
+        f"⚡ <b>Твой уровень</b>\n\n"
+        f"{p['tier_emoji']} Lv <b>{p['level']}</b> — <b>{p['tier']}</b>\n"
+        f"{bar} {p['progress_pct']}%\n\n"
+        f"💰 Заработано: <b>{p['total_robux']:,}</b> R$\n"
+        f"📈 До Lv {p['level']+1}: <b>{p['xp_needed']-p['xp_in_level']}</b> R$\n"
+    )
+    if cur_tier:
+        text += f"\n🔓 Разблокировано:\n" + "\n".join(f"  {pk}" for pk in cur_tier["perks"]) + "\n"
+    if next_tier:
+        text += f"\n⬆️ Следующий тир — <b>{next_tier['emoji']} {next_tier['name']}</b> (Lv {next_tier['min_level']}):\n"
+        text += "\n".join(f"  🔒 {pk}" for pk in next_tier["perks"])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗺 Карта уровней", web_app=WebAppInfo(url=MINIAPP_URL + "#levels")),
+    ]])
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.message(Command("setnick"))
+async def cmd_setnick(msg: Message):
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await msg.answer("Использование: /setnick <b>ТвойНик</b>", parse_mode="HTML")
+        return
+    nick = parts[1].strip()[:24]
+    if len(nick) < 1:
+        await msg.answer("Ник слишком короткий.")
+        return
+    changes = db_v2.get_nickname_changes(tg_id=msg.from_user.id)
+    if changes >= 1:
+        await msg.answer(
+            f"⭐ Смена ника стоит <b>{db_v2.NICKNAME_CHANGE_PRICE_STARS} Stars</b>.\n"
+            f"Открой Mini App и поменяй там — оплата произойдёт через Telegram Stars.",
+            parse_mode="HTML",
+        )
+        return
+    if not db_v2.set_nickname(msg.from_user.id, nick):
+        await msg.answer(
+            f"❌ Ник <b>{nick}</b> уже занят. Выбери другой.",
+            parse_mode="HTML",
+        )
+        return
+    await msg.answer(f"✅ Ник установлен: <b>{nick}</b>\n<i>Это была бесплатная смена. Следующая — за {db_v2.NICKNAME_CHANGE_PRICE_STARS} ⭐</i>", parse_mode="HTML")
+
+
+# ── Support chat ──────────────────────────────────────────────────────────────
+
+class SupportState(StatesGroup):
+    chatting = State()
+
+
+@dp.message(Command("support"))
+async def cmd_support(msg: Message, state: FSMContext):
+    await state.set_state(SupportState.chatting)
+    await msg.answer(
+        "💬 <b>Поддержка</b>\n\n"
+        "Напиши свой вопрос — он будет передан админу. "
+        "Ответ придёт в этот же чат.\n\n"
+        "Чтобы выйти, напиши /cancel",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(SupportState.chatting, Command("cancel"))
+async def cmd_support_cancel(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Вышел из поддержки.")
+
+
+@dp.message(SupportState.chatting, F.text & ~F.text.startswith("/"))
+async def support_user_message(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    if len(text) > 2000:
+        await msg.answer("Сообщение слишком длинное (макс. 2000 символов).")
+        return
+    if not db_v2.support_rate_check(msg.from_user.id, max_per_min=5):
+        await msg.answer("Слишком часто. Подожди минуту.")
+        return
+
+    name = msg.from_user.full_name or "—"
+    username = msg.from_user.username
+    try:
+        forwarded = await bot.send_message(
+            ADMIN_TG_ID,
+            f"💬 <b>Поддержка · {name}</b>\n"
+            f"<a href='tg://user?id={msg.from_user.id}'>tg://{msg.from_user.id}</a>"
+            f"{' · @' + username if username else ''} · из бота\n\n"
+            f"{text}\n\n"
+            f"<i>Ответь на это сообщение — отправлю пользователю</i>",
+            parse_mode="HTML",
+        )
+        db_v2.support_save(msg.from_user.id, "in", text, admin_msg_id=forwarded.message_id)
+        await msg.answer("✓ Передано админу. Ответ придёт сюда.")
+    except Exception as e:
+        await msg.answer(f"Не удалось отправить: {e}")
+
+
+# Admin replies — only matches when reply_to is actually a forwarded support message,
+# so it doesn't shadow other admin-reply handlers (payouts, applications, etc).
+def _is_support_reply(message: Message) -> bool:
+    if not message.from_user or message.from_user.id != ADMIN_TG_ID:
+        return False
+    if not message.reply_to_message or not message.text:
+        return False
+    if message.text.startswith("/"):
+        return False
+    return db_v2.support_find_user_by_admin_msg(message.reply_to_message.message_id) is not None
+
+
+@dp.message(_is_support_reply)
+async def admin_support_reply(msg: Message):
+    rep_to = msg.reply_to_message
+    target_tg = db_v2.support_find_user_by_admin_msg(rep_to.message_id)
+    if not target_tg:
+        return
+    text = (msg.text or "").strip()[:2000]
+    try:
+        await bot.send_message(
+            target_tg,
+            f"💬 <b>Ответ поддержки</b>\n\n{text}",
+            parse_mode="HTML",
+        )
+        db_v2.support_save(target_tg, "out", text)
+        await msg.reply("✓ Отправлено.")
+    except Exception as e:
+        await msg.reply(f"Не удалось: {e}")
+
+
+# ── Telegram Stars payments for nickname changes ─────────────────────────────
+from aiogram.types import PreCheckoutQuery
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    """Validate that the payload is a known pending payment we created."""
+    payload = query.invoice_payload or ""
+    if payload.startswith("nick:"):
+        if not db_v2.is_pending_nick_payment(payload, query.from_user.id):
+            await query.answer(ok=False, error_message="Платёж не найден или уже использован")
+            return
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def on_payment_success(msg: Message):
+    sp = msg.successful_payment
+    payload = sp.invoice_payload or ""
+    if not payload.startswith("nick:"):
+        return
+
+    # Atomically consume the payment record. Returns the nickname that was
+    # locked in at invoice-creation time, or None if already used / not ours.
+    new_nick = db_v2.consume_nick_payment(payload, msg.from_user.id)
+    if not new_nick:
+        await msg.answer("⚠️ Платёж не найден или уже был использован.")
+        return
+
+    # Apply nickname (atomic uniqueness check). If the name was taken between
+    # invoice creation and payment, refund the Stars.
+    if db_v2.set_nickname(msg.from_user.id, new_nick):
+        await msg.answer(
+            f"✅ <b>Ник изменён на:</b> {new_nick}\n"
+            f"💫 Спасибо за оплату {sp.total_amount} ⭐",
+            parse_mode="HTML",
+        )
+        return
+
+    # Nickname is taken — refund Stars
+    refunded = False
+    try:
+        await bot.refund_star_payment(
+            user_id=msg.from_user.id,
+            telegram_payment_charge_id=sp.telegram_payment_charge_id,
+        )
+        refunded = True
+    except Exception as e:
+        logging.exception(f"Failed to refund stars: {e}")
+    if refunded:
+        await msg.answer(
+            f"❌ Ник <b>{new_nick}</b> успели занять. Звёзды возвращены 💫",
+            parse_mode="HTML",
+        )
+    else:
+        await msg.answer(
+            f"❌ Ник <b>{new_nick}</b> успели занять. Напиши админу для возврата звёзд.",
+            parse_mode="HTML",
+        )
 
 
 if __name__ == "__main__":

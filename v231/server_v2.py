@@ -20,20 +20,39 @@ from config import (API_PORT, API_SECRET, BOT_TOKEN, ADMIN_TG_ID,
                     ADMIN_URL_PREFIX as _ADMIN_PFX)
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+
+# Persistent session secret (survives restarts so admin sessions stay valid)
+_SESSION_KEY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".session_key")
+try:
+    if os.path.exists(_SESSION_KEY_PATH):
+        with open(_SESSION_KEY_PATH, "rb") as f:
+            app.secret_key = f.read()
+    else:
+        app.secret_key = secrets.token_bytes(32)
+        with open(_SESSION_KEY_PATH, "wb") as f:
+            f.write(app.secret_key)
+        try:
+            os.chmod(_SESSION_KEY_PATH, 0o600)
+        except Exception:
+            pass
+except Exception:
+    app.secret_key = secrets.token_bytes(32)
+
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"]   = True   # we run behind HTTPS via nginx
 
 
 def _real_ip() -> str:
-    """Get real client IP behind Cloudflare Tunnel / reverse proxy."""
-    # CF-Connecting-IP is set by Cloudflare and cannot be spoofed by the client
-    # when traffic goes through Cloudflare (which it always does via cloudflared tunnel)
-    return (request.headers.get("CF-Connecting-IP")
-            or request.headers.get("X-Real-IP")
-            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-            or request.remote_addr
-            or "?")
+    """Get real client IP. Trusts proxy headers ONLY when request comes from localhost
+    (i.e., from our nginx). Direct external requests use remote_addr."""
+    if request.remote_addr in ("127.0.0.1", "::1", None):
+        # Behind nginx — trust X-Real-IP (set by our nginx config)
+        return (request.headers.get("X-Real-IP")
+                or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                or "127.0.0.1")
+    # Direct connection — don't trust client-supplied headers
+    return request.remote_addr or "?"
 
 
 # ── Admin password hashing ───────────────────────────────────────────────
@@ -229,6 +248,38 @@ def _log_session_to_file(name: str, uid: str, started_at: float,
 
 # ── Session watcher ────────────────────────────────────────────────────────
 
+_overtake_notif_cooldown: dict[str, float] = {}
+_OVERTAKE_COOLDOWN = 1800  # 30 минут между уведомлениями об обгоне
+
+
+def _send_overtake_notifications(info: dict):
+    now = time.time()
+    new_rank = info["new_rank"]
+    actor_tg_id = info.get("actor_tg_id")
+
+    if actor_tg_id and new_rank <= 10:
+        key = f"up_{actor_tg_id}"
+        if now - _overtake_notif_cooldown.get(key, 0) > _OVERTAKE_COOLDOWN:
+            _overtake_notif_cooldown[key] = now
+            if new_rank <= 5:
+                _send_tg(actor_tg_id,
+                    f"🏆 <b>Ты в топ-5!</b> Место <b>#{new_rank}</b>\n"
+                    f"Удержи его до конца недели — и приз твой!")
+            else:
+                _send_tg(actor_tg_id,
+                    f"⚡ Ты поднялся до <b>#{new_rank} места</b> в топе недели — продолжай!")
+
+    for victim in info.get("overtaken", []):
+        vtg = victim.get("tg_id")
+        if not vtg:
+            continue
+        key = f"down_{vtg}"
+        if now - _overtake_notif_cooldown.get(key, 0) > _OVERTAKE_COOLDOWN:
+            _overtake_notif_cooldown[key] = now
+            _send_tg(vtg,
+                f"😬 <b>Тебя обогнали!</b> Фарми активнее, чтобы удержать место в топе 💪")
+
+
 def _close_account_session(uid: str, info: dict, ended_at: float):
     """Закрыть сессию одного аккаунта: записать в БД + лог файл."""
     sid = info.get("session_id")
@@ -244,7 +295,9 @@ def _close_account_session(uid: str, info: dict, ended_at: float):
                   "no_response", "donations", "robux_gross",
                   "hops", "raised_current")
     }
-    db_v2.close_session(sid, ended_at, delta)
+    overtake_info = db_v2.close_session(sid, ended_at, delta)
+    if overtake_info:
+        _send_overtake_notifications(overtake_info)
 
     # Рассчитать duration для лога
     started_at = info.get("session_start_stats", {})  # не то — берём из БД
@@ -362,6 +415,108 @@ def activate():
 @app.route("/v2/ping")
 def ping():
     return jsonify({"ok": True})
+
+
+@app.route("/loader.lua")
+def serve_loader():
+    p = os.path.join(os.path.dirname(__file__), "loader_v2_obf.lua")
+    if not os.path.exists(p):
+        p = os.path.join(os.path.dirname(__file__), "loader_v2.lua")
+    if not os.path.exists(p):
+        return Response("Loader not found", status=500)
+    with open(p, "rb") as f:
+        return Response(f.read(), mimetype="text/plain; charset=utf-8")
+
+
+# ─── Installer (Auto-Deploy .exe) endpoints ────────────────────────────────
+# Used by the desktop installer that customers run after buying a license.
+# It checks the key, then pulls a manifest with loader-line + gamepass spec
+# so we can roll changes server-side without re-shipping the .exe.
+
+_INSTALLER_GAMEPASS_AMOUNTS = [
+    5, 10, 15, 25, 50, 100, 150, 250, 500,
+    1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000,
+]
+
+
+def _installer_license_payload(lic: dict) -> dict:
+    now = time.time()
+    expires_at = lic.get("expires_at")
+    max_acc = int(lic.get("max_accounts") or 5)
+    cur_acc = db_v2.count_allowed_accounts(lic["key"])
+    return {
+        "ok": True,
+        "tg_id": lic.get("tg_id"),
+        "type": "trial" if expires_at else "lifetime",
+        "expires_at": expires_at,
+        "expires_in_days": int((expires_at - now) / 86400) if expires_at else None,
+        "max_accounts": max_acc,
+        "accounts_used": cur_acc,
+        "roblox_user_id": lic.get("roblox_user_id"),
+        "roblox_name": lic.get("roblox_name") or "",
+    }
+
+
+@app.route("/v2/installer/check_license", methods=["POST"])
+def installer_check_license():
+    ip = _real_ip()
+    if not _rl_check(ip):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    if not key:
+        _rl_fail(ip)
+        return jsonify({"ok": False, "error": "missing_key"}), 400
+
+    lic = db_v2.get_license(key)
+    if not lic:
+        _rl_fail(ip)
+        return jsonify({"ok": False, "error": "key_not_found"}), 403
+    if not db_v2.is_key_valid(lic):
+        _rl_fail(ip)
+        if lic.get("expires_at") and time.time() > lic["expires_at"]:
+            return jsonify({"ok": False, "error": "expired"}), 403
+        return jsonify({"ok": False, "error": "revoked"}), 403
+
+    return jsonify(_installer_license_payload(lic))
+
+
+@app.route("/v2/installer/manifest", methods=["POST"])
+def installer_manifest():
+    """Returns everything the installer needs: loader-line, gamepass spec, etc.
+    Requires a valid key so that random scrapers can't enumerate the config."""
+    ip = _real_ip()
+    if not _rl_check(ip):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    if not key:
+        _rl_fail(ip)
+        return jsonify({"ok": False, "error": "missing_key"}), 400
+
+    lic = db_v2.get_license(key)
+    if not lic or not db_v2.is_key_valid(lic):
+        _rl_fail(ip)
+        return jsonify({"ok": False, "error": "invalid_key"}), 403
+
+    api_url = (_CFG_API_BASE_URL or request.host_url).rstrip("/")
+    loader_line = f'loadstring(game:HttpGet("{api_url}/loader.lua"))()'
+
+    return jsonify({
+        "ok": True,
+        "loader_line": loader_line,
+        "loader_url": f"{api_url}/loader.lua",
+        "gamepass_amounts": _INSTALLER_GAMEPASS_AMOUNTS,
+        "gamepass_name_template": "Donate {amount} R$",
+        "place_name": "Beggr Hub",
+        "place_description": "auto-created by installer",
+        "place_id_pls_donate": 8737602449,
+        "bloxstrap_repo": "pizzaboxer/bloxstrap",
+        "support_tg": "https://t.me/PlsDonateeBot",
+        "license": _installer_license_payload(lic),
+    })
 
 
 @app.route("/v2/getscript")
@@ -1962,6 +2117,841 @@ def admin_api_analytics():
     cutoff = now - hours * 3600
     data = db_v2.get_hourly_analytics(cutoff, license_key=key)
     return jsonify({"hours": data, "period": hours})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEBAPP API  — /webapp/*  and  /miniapp
+# ══════════════════════════════════════════════════════════════════════════════
+
+import hashlib as _hl, hmac as _hmac
+
+_MINIAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp")
+
+
+_INITDATA_MAX_AGE = 86400  # 24 hours
+
+
+def _verify_tg_initdata(init_data: str) -> int | None:
+    """Verify Telegram WebApp initData HMAC + freshness. Returns tg_id or None."""
+    try:
+        from urllib.parse import unquote, parse_qsl
+        parts = dict(parse_qsl(unquote(init_data), keep_blank_values=True))
+        check_hash = parts.pop("hash", "")
+        if not check_hash:
+            return None
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(parts.items()))
+        secret = _hmac.new(b"WebAppData", BOT_TOKEN.encode(), _hl.sha256).digest()
+        expected = _hmac.new(secret, data_check.encode(), _hl.sha256).hexdigest()
+        if not secrets.compare_digest(expected, check_hash):
+            return None
+        # Freshness: initData older than 24h is rejected
+        try:
+            auth_date = int(parts.get("auth_date", "0"))
+        except (TypeError, ValueError):
+            return None
+        if not auth_date or time.time() - auth_date > _INITDATA_MAX_AGE:
+            return None
+        import json as _j
+        user = _j.loads(parts.get("user", "{}"))
+        uid = user.get("id")
+        return int(uid) if uid else None
+    except Exception:
+        return None
+
+
+def _require_tg_auth() -> int | None:
+    """Get authenticated tg_id from request. Returns None if not authenticated."""
+    init_data = request.headers.get("X-Tg-Init-Data", "")
+    if not init_data:
+        return None
+    return _verify_tg_initdata(init_data)
+
+
+# ── Webapp rate limiter (per IP, per minute) ─────────────────────────────────
+_webapp_rl: dict[str, list] = {}
+_webapp_rl_lock = threading.Lock()
+_WEBAPP_RL_MAX    = 90    # requests per minute per IP
+_WEBAPP_RL_WINDOW = 60
+
+
+def _webapp_rate_check() -> bool:
+    ip = _real_ip()
+    now = time.time()
+    with _webapp_rl_lock:
+        # Periodic cleanup
+        if len(_webapp_rl) > 5000:
+            for k in list(_webapp_rl.keys()):
+                if not _webapp_rl[k] or now - max(_webapp_rl[k]) > _WEBAPP_RL_WINDOW * 2:
+                    del _webapp_rl[k]
+        recent = [t for t in _webapp_rl.get(ip, []) if now - t < _WEBAPP_RL_WINDOW]
+        if len(recent) >= _WEBAPP_RL_MAX:
+            _webapp_rl[ip] = recent
+            return False
+        recent.append(now)
+        _webapp_rl[ip] = recent
+        return True
+
+
+@app.after_request
+def _no_cache_webapp(resp):
+    """Disable caching on /webapp/* responses so Mini App always sees fresh data."""
+    if request.path.startswith("/webapp/"):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
+@app.route("/miniapp")
+def miniapp_index():
+    try:
+        with open(os.path.join(_MINIAPP_DIR, "index.html"), encoding="utf-8") as f:
+            return f.read(), 200, {"Content-Type": "text/html; charset=utf-8"}
+    except FileNotFoundError:
+        return "Mini App not found", 404
+
+
+@app.route("/miniapp/<path:filename>")
+def miniapp_static(filename):
+    from flask import send_from_directory
+    return send_from_directory(_MINIAPP_DIR, filename)
+
+
+@app.route("/webapp/profile")
+def webapp_profile():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    profile = db_v2.get_webapp_profile(tg_id=tg_id)
+    if not profile:
+        return jsonify({"error": "no active license"}), 404
+    return jsonify(profile)
+
+
+def _merge_live_leaderboard(rows: list, ws: float) -> list:
+    tg_to_row = {r["tg_id"]: r for r in rows if r.get("tg_id")}
+    for uid, info in list(_online_cache.items()):
+        tg_id = info.get("tg_id")
+        if not tg_id:
+            continue
+        start_robux = (info.get("session_start_stats") or {}).get("robux_gross") or 0
+        acc = db_v2.get_account(uid)
+        if not acc:
+            continue
+        current_robux = acc.get("robux_gross") or 0
+        delta = max(0, current_robux - start_robux)
+        if delta <= 0:
+            continue
+        if tg_id in tg_to_row:
+            tg_to_row[tg_id]["robux_week"] = (tg_to_row[tg_id].get("robux_week") or 0) + delta
+        else:
+            user = db_v2.get_user(tg_id)
+            name = ((user.get("nickname") or user.get("tg_username") or user.get("tg_name")) if user else None) or f"tg:{tg_id}"
+            new_row = {
+                "tg_id": tg_id, "dc_id": None, "robux_week": delta,
+                "week_start": ws, "display_name": name, "source": "tg", "rank_pos": 0,
+            }
+            rows.append(new_row)
+            tg_to_row[tg_id] = new_row
+    rows.sort(key=lambda x: x.get("robux_week") or 0, reverse=True)
+    for i, r in enumerate(rows):
+        r["rank_pos"] = i + 1
+    return rows
+
+
+@app.route("/webapp/leaderboard")
+def webapp_leaderboard():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    period = request.args.get("period", "week")
+    if period == "week":
+        ws = db_v2.get_week_start()
+    elif period == "prev":
+        ws = db_v2.get_week_start() - 7 * 86400
+    else:
+        ws = None
+    rows = db_v2.get_weekly_leaderboard(ws, limit=50) if ws is not None else db_v2.get_weekly_leaderboard(limit=50)
+    if period == "week":
+        rows = _merge_live_leaderboard(rows, ws)
+    week_ends = (db_v2.get_week_start() + 7 * 86400) if period == "week" else None
+    return jsonify({"leaderboard": rows, "week_ends": week_ends, "period": period})
+
+
+@app.route("/webapp/levels")
+def webapp_levels():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    return jsonify({"tiers": db_v2.get_all_tiers(), "robux_per_level": db_v2._ROBUX_PER_LEVEL})
+
+
+@app.route("/webapp/my_accounts")
+def webapp_my_accounts():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    return jsonify({"accounts": db_v2.get_my_accounts(tg_id)})
+
+
+@app.route("/webapp/chart")
+def webapp_chart():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    try:
+        days = min(30, max(1, int(request.args.get("days", 7))))
+    except (ValueError, TypeError):
+        days = 7
+    data = db_v2.get_robux_by_days(tg_id=tg_id, days=days)
+    return jsonify({"chart": data, "days": days})
+
+
+@app.route("/webapp/setnick", methods=["POST"])
+def webapp_setnick():
+    """First nickname change is free, after that requires Stars payment."""
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+
+    body = request.get_json(silent=True) or {}
+    nick = (body.get("nickname", "") or "").strip()
+    if not nick or len(nick) > 24:
+        return jsonify({"error": "nickname 1-24 chars"}), 400
+
+    changes = db_v2.get_nickname_changes(tg_id=tg_id)
+    if changes >= 1:
+        return jsonify({
+            "error": "payment_required",
+            "message": f"Смена ника стоит {db_v2.NICKNAME_CHANGE_PRICE_STARS} ⭐",
+            "price_stars": db_v2.NICKNAME_CHANGE_PRICE_STARS,
+        }), 402
+
+    if not db_v2.set_nickname(tg_id, nick):
+        return jsonify({"error": "nickname_taken", "message": "Этот ник уже занят"}), 409
+    return jsonify({"ok": True, "nickname": nick, "free": True})
+
+
+@app.route("/webapp/check_nick")
+def webapp_check_nick():
+    """Live availability check (used by Mini App as user types)."""
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    nick = (request.args.get("n", "") or "").strip()
+    if not nick or len(nick) > 24:
+        return jsonify({"available": False, "reason": "invalid"}), 200
+    taken = db_v2.is_nickname_taken(nick, exclude_tg_id=tg_id)
+    return jsonify({"available": not taken})
+
+
+@app.route("/webapp/nick_invoice", methods=["POST"])
+def webapp_nick_invoice():
+    """Create a Telegram Stars invoice link for nickname change.
+    Stores payload→nickname mapping in DB to prevent replay/swap."""
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+
+    body = request.get_json(silent=True) or {}
+    nick = (body.get("nickname", "") or "").strip()
+    if not nick or len(nick) > 24:
+        return jsonify({"error": "nickname 1-24 chars"}), 400
+
+    # Pre-check uniqueness BEFORE creating the invoice — don't waste user's stars
+    if db_v2.is_nickname_taken(nick, exclude_tg_id=tg_id):
+        return jsonify({"error": "nickname_taken", "message": "Этот ник уже занят"}), 409
+
+    payload = f"nick:{tg_id}:{secrets.token_hex(8)}"
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/createInvoiceLink",
+            json={
+                "title": "Смена ника",
+                "description": f"Установить новый ник: {nick}",
+                "payload": payload,
+                "currency": "XTR",
+                "prices": [{"label": "Смена ника", "amount": db_v2.NICKNAME_CHANGE_PRICE_STARS}],
+            }, timeout=10).json()
+    except Exception:
+        return jsonify({"error": "invoice failed"}), 500
+    if not resp.get("ok"):
+        return jsonify({"error": "invoice failed"}), 500
+
+    # Record payload BEFORE returning URL so payment can be verified later
+    db_v2.create_nick_payment(payload, tg_id, nick)
+    return jsonify({"invoice_url": resp["result"]})
+
+
+@app.route("/webapp/setavatar", methods=["POST"])
+def webapp_setavatar():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+
+    body = request.get_json(silent=True) or {}
+    emoji = body.get("emoji")
+    grad  = body.get("grad")
+    if emoji and emoji not in db_v2.AVATAR_EMOJIS:
+        return jsonify({"error": "invalid emoji"}), 400
+    if grad and grad not in db_v2.AVATAR_GRADS:
+        return jsonify({"error": "invalid gradient"}), 400
+    db_v2.set_avatar(tg_id=tg_id, emoji=emoji, grad=grad)
+    return jsonify({"ok": True, "emoji": emoji, "grad": grad})
+
+
+@app.route("/webapp/avatars")
+def webapp_avatars():
+    return jsonify({
+        "emojis": db_v2.AVATAR_EMOJIS,
+        "grads": db_v2.AVATAR_GRADS,
+    })
+
+
+# ── Achievements ──────────────────────────────────────────────────────────────
+
+@app.route("/webapp/achievements")
+def webapp_achievements():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    new_unlocks = db_v2.check_achievements(tg_id)
+    unlocked = db_v2.get_user_achievements(tg_id)
+    unlocked_ids = {a["id"] for a in unlocked}
+    all_list = []
+    for a in db_v2.ACHIEVEMENTS:
+        all_list.append({**a, "unlocked": a["id"] in unlocked_ids,
+                         "unlocked_at": next((u["unlocked_at"] for u in unlocked if u["id"] == a["id"]), None)})
+    return jsonify({
+        "achievements": all_list,
+        "total": len(db_v2.ACHIEVEMENTS),
+        "unlocked_count": len(unlocked_ids),
+        "new_unlocks": [db_v2.ACHIEVEMENTS_BY_ID[i] for i in new_unlocks if i in db_v2.ACHIEVEMENTS_BY_ID],
+    })
+
+
+# ── Daily tasks ───────────────────────────────────────────────────────────────
+
+@app.route("/webapp/tasks")
+def webapp_tasks():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    tasks = db_v2.get_or_generate_daily_tasks(tg_id)
+    next_reset = db_v2.get_day_start() + 86400
+    return jsonify({"tasks": tasks, "next_reset": next_reset})
+
+
+@app.route("/webapp/tasks/claim", methods=["POST"])
+def webapp_tasks_claim():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    body = request.get_json(silent=True) or {}
+    try:
+        task_id = int(body.get("task_id", 0))
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid task_id"}), 400
+    if not task_id:
+        return jsonify({"error": "task_id required"}), 400
+    result = db_v2.claim_daily_task(tg_id, task_id)
+    if not result:
+        return jsonify({"error": "task not claimable"}), 409
+    return jsonify({"ok": True, **result})
+
+
+# ── Public user card ──────────────────────────────────────────────────────────
+
+@app.route("/webapp/user_card")
+def webapp_user_card():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    if not _require_tg_auth():
+        return jsonify({"error": "auth required"}), 401
+    try:
+        target_id = int(request.args.get("id", 0))
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid id"}), 400
+    if not target_id:
+        return jsonify({"error": "id required"}), 400
+    card = db_v2.get_public_profile(target_id)
+    if not card:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(card)
+
+
+# ── Referrals ─────────────────────────────────────────────────────────────────
+
+_bot_username_cache: dict = {"value": None, "fetched_at": 0}
+
+
+def _get_bot_username() -> str:
+    """Cached bot username (TTL 1 hour). Avoids hitting getMe on every request."""
+    now = time.time()
+    if _bot_username_cache["value"] and now - _bot_username_cache["fetched_at"] < 3600:
+        return _bot_username_cache["value"]
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=5).json()
+        username = resp.get("result", {}).get("username", "")
+        if username:
+            _bot_username_cache["value"] = username
+            _bot_username_cache["fetched_at"] = now
+        return username
+    except Exception:
+        return _bot_username_cache.get("value") or ""
+
+
+@app.route("/webapp/referrals")
+def webapp_referrals():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    data = db_v2.get_webapp_referrals(tg_id)
+    bot_username = _get_bot_username()
+    data["ref_link"] = f"https://t.me/{bot_username}?start=ref_{tg_id}" if bot_username else f"?start=ref_{tg_id}"
+    return jsonify(data)
+
+
+# ── Global chat ───────────────────────────────────────────────────────────────
+
+@app.route("/webapp/chat/messages")
+def webapp_chat_messages():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    try:
+        since_id = int(request.args.get("since_id", 0))
+    except (ValueError, TypeError):
+        since_id = 0
+    messages = db_v2.chat_get_recent(limit=50, since_id=since_id)
+    return jsonify({"messages": messages, "you": tg_id})
+
+
+@app.route("/webapp/chat/send", methods=["POST"])
+def webapp_chat_send():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+
+    # Must have an active license to write
+    lic = db_v2.get_license_by_tg(tg_id)
+    if not lic or not db_v2.is_key_valid(lic):
+        return jsonify({"error": "Только пользователи с активным ключом могут писать в чат"}), 403
+
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text", "") or "").strip()
+    if not text:
+        return jsonify({"error": "пустое сообщение"}), 400
+    if len(text) > 500:
+        return jsonify({"error": "слишком длинное (макс. 500 символов)"}), 400
+
+    is_muted, until, reason = db_v2.chat_is_muted(tg_id)
+    if is_muted:
+        mins_left = max(1, int((until - time.time()) / 60))
+        return jsonify({"error": f"Ты в муте на ещё {mins_left} мин" + (f" ({reason})" if reason else "")}), 403
+
+    if not db_v2.chat_rate_check(tg_id, max_per_min=5):
+        return jsonify({"error": "слишком часто, подожди"}), 429
+
+    mid = db_v2.chat_send(tg_id, text)
+    if not mid:
+        return jsonify({"error": "не получилось"}), 500
+    return jsonify({"ok": True, "id": mid})
+
+
+# ── Support chat ──────────────────────────────────────────────────────────────
+
+@app.route("/webapp/support/messages")
+def webapp_support_messages():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    msgs = db_v2.support_history(tg_id, limit=100)
+    db_v2.support_mark_read(tg_id)
+    return jsonify({"messages": msgs})
+
+
+@app.route("/webapp/support/unread")
+def webapp_support_unread():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    return jsonify({"unread": db_v2.support_unread_count(tg_id)})
+
+
+@app.route("/webapp/support/send", methods=["POST"])
+def webapp_support_send():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text", "") or "").strip()
+    if not text:
+        return jsonify({"error": "пустое сообщение"}), 400
+    if len(text) > 2000:
+        return jsonify({"error": "слишком длинное (макс. 2000 символов)"}), 400
+    if not db_v2.support_rate_check(tg_id, max_per_min=5):
+        return jsonify({"error": "слишком много сообщений, подожди немного"}), 429
+
+    user = db_v2.get_user(tg_id) or {}
+    name = user.get("nickname") or user.get("tg_username") or user.get("tg_name") or str(tg_id)
+
+    admin_msg_id = None
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": ADMIN_TG_ID,
+                "text": (
+                    f"💬 <b>Поддержка · {name}</b>\n"
+                    f"<a href='tg://user?id={tg_id}'>tg://{tg_id}</a> · из Mini App\n\n"
+                    f"{text}\n\n"
+                    f"<i>Ответь на это сообщение — отправлю пользователю</i>"
+                ),
+                "parse_mode": "HTML",
+            }, timeout=10).json()
+        if resp.get("ok"):
+            admin_msg_id = resp["result"]["message_id"]
+    except Exception as e:
+        print(f"[support] forward failed: {e}")
+
+    msg_id = db_v2.support_save(tg_id, "in", text, admin_msg_id=admin_msg_id)
+    return jsonify({"ok": True, "id": msg_id})
+
+
+@app.route("/webapp/cashout", methods=["POST"])
+def webapp_cashout():
+    if not _webapp_rate_check():
+        return jsonify({"error": "rate limited"}), 429
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+    body = request.get_json(silent=True) or {}
+    try:
+        amount = int(body.get("amount", 0))
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid amount"}), 400
+    if amount < 50:
+        return jsonify({"error": "minimum 50 R$"}), 400
+    if db_v2.has_pending_payout(tg_id):
+        return jsonify({"error": "already pending"}), 409
+    balance = db_v2.get_ref_balance(tg_id)
+    if amount > balance:
+        return jsonify({"error": "insufficient balance"}), 400
+    user = db_v2.get_user(tg_id)
+    rid = db_v2.create_payout_request(
+        tg_id, user.get("tg_username", "") if user else "",
+        user.get("tg_name", "") if user else "",
+        amount,
+    )
+    return jsonify({"ok": True, "request_id": rid, "amount": amount})
+
+
+# ── Custom avatar upload ─────────────────────────────────────────────────────
+_AVATAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatars")
+os.makedirs(_AVATAR_DIR, exist_ok=True)
+_AVATAR_MAX_BYTES = 2 * 1024 * 1024     # 2 MB upload limit
+_AVATAR_OUT_SIZE  = 256                  # 256x256 final
+_AVATAR_RATE_LIMIT_PER_HOUR = 8
+_AVATAR_MAX_DIMENSION = 4096
+
+# Set Pillow decompression bomb limit ONCE at module load (thread-safe)
+try:
+    from PIL import Image as _PILImage
+    _PILImage.MAX_IMAGE_PIXELS = _AVATAR_MAX_DIMENSION * _AVATAR_MAX_DIMENSION
+except ImportError:
+    pass
+
+# Per-user upload counters
+_avatar_upload_log: dict[int, list] = {}
+_avatar_upload_lock = threading.Lock()
+
+
+def _avatar_rate_check(tg_id: int) -> bool:
+    now = time.time()
+    with _avatar_upload_lock:
+        # Cleanup stale entries
+        if len(_avatar_upload_log) > 5000:
+            for k in list(_avatar_upload_log.keys()):
+                if not _avatar_upload_log[k] or now - max(_avatar_upload_log[k]) > 7200:
+                    del _avatar_upload_log[k]
+        recent = [t for t in _avatar_upload_log.get(tg_id, []) if now - t < 3600]
+        if len(recent) >= _AVATAR_RATE_LIMIT_PER_HOUR:
+            _avatar_upload_log[tg_id] = recent
+            return False
+        recent.append(now)
+        _avatar_upload_log[tg_id] = recent
+        return True
+
+
+def _validate_image_bytes(data: bytes) -> bool:
+    if len(data) < 16:
+        return False
+    if data.startswith(b"\xff\xd8\xff"):
+        return True  # JPEG
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True  # PNG
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True  # WebP
+    return False
+
+
+@app.route("/webapp/upload_avatar", methods=["POST"])
+def webapp_upload_avatar():
+    tg_id = _require_tg_auth()
+    if not tg_id:
+        return jsonify({"error": "auth required"}), 401
+
+    if not _avatar_rate_check(tg_id):
+        return jsonify({"error": "rate limited, try later"}), 429
+
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "no file"}), 400
+
+    # 1. Read with hard size cap, then drain the rest of the stream
+    raw = f.stream.read(_AVATAR_MAX_BYTES + 1)
+    if len(raw) > _AVATAR_MAX_BYTES:
+        try:
+            while f.stream.read(65536):
+                pass
+        except Exception:
+            pass
+        return jsonify({"error": "file too large (max 2MB)"}), 413
+
+    # 2. Magic-number check
+    if not _validate_image_bytes(raw):
+        return jsonify({"error": "only JPEG/PNG/WebP allowed"}), 400
+
+    # 3. Pillow decode + verify + re-encode (strips EXIF, embedded scripts)
+    try:
+        from PIL import Image, ImageOps
+        from io import BytesIO
+
+        # First pass: integrity check on a fresh buffer
+        with Image.open(BytesIO(raw)) as probe:
+            # Reject too-large dimensions BEFORE full decode
+            if probe.width > _AVATAR_MAX_DIMENSION or probe.height > _AVATAR_MAX_DIMENSION:
+                return jsonify({"error": "image dimensions too large"}), 400
+            probe.verify()
+
+        # Second pass: actual processing
+        img = Image.open(BytesIO(raw))
+        img.load()  # force full decode now (catches truncated)
+        img = ImageOps.exif_transpose(img)
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if img.mode in ("LA", "PA", "P") else "RGB")
+        # Center-crop to square
+        w, h = img.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top  = (h - side) // 2
+        img = img.crop((left, top, left + side, top + side))
+        img = img.resize((_AVATAR_OUT_SIZE, _AVATAR_OUT_SIZE), Image.LANCZOS)
+        if img.mode != "RGB":
+            bg = Image.new("RGB", img.size, (10, 8, 19))
+            bg.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+            img = bg
+
+        # Atomic write: tmpfile → rename
+        out_path = os.path.join(_AVATAR_DIR, f"{tg_id}.webp")
+        tmp_path = out_path + f".tmp.{secrets.token_hex(4)}"
+        img.save(tmp_path, format="WEBP", quality=85, method=6)
+        img.close()
+        os.replace(tmp_path, out_path)
+    except Exception:
+        return jsonify({"error": "invalid image"}), 400
+
+    filename = f"{tg_id}.webp"
+    db_v2.set_avatar_image(tg_id=tg_id, filename=filename)
+    return jsonify({"ok": True, "image": filename, "url": f"/avatars/{filename}?v={int(time.time())}"})
+
+
+@app.route("/avatars/<path:filename>")
+def serve_avatar(filename):
+    # Strict allowlist: only "<digits>.webp"
+    import re
+    if not re.match(r"^\d+\.webp$", filename):
+        return "not found", 404
+    from flask import send_from_directory
+    try:
+        resp = send_from_directory(_AVATAR_DIR, filename)
+        resp.headers["Content-Type"] = "image/webp"
+        resp.headers["Cache-Control"] = "public, max-age=300"
+        resp.headers["Content-Security-Policy"] = "default-src 'none'"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+    except Exception:
+        return "not found", 404
+
+
+# ── Weekly settlement watcher ─────────────────────────────────────────────────
+
+def _weekly_watcher():
+    import datetime
+    while True:
+        time.sleep(3600)
+        try:
+            now = time.time()
+            current_ws = db_v2.get_week_start(now)
+            prev_ws = current_ws - 7 * 86400
+            last_settled = db_v2.get_last_settled_week()
+            if last_settled is None or last_settled < prev_ws:
+                winners = db_v2.settle_weekly_rankings(prev_ws)
+                if winners:
+                    print(f"[weekly] Settled {len(winners)} winners for week {prev_ws}")
+                    for w in winners:
+                        if w["prize"] and w["tg_id"]:
+                            _send_tg(w["tg_id"],
+                                f"🏆 <b>Итоги недели!</b>\n\n"
+                                f"Ты занял <b>#{w['rank']}</b> место в топе фармеров!\n"
+                                f"Заработано за неделю: <b>{w['robux']} R$</b>\n"
+                                f"Приз зачислен: <b>+{w['prize']} R$</b> на баланс 🎁")
+                    top1 = winners[0]
+                    db_v2.chat_send_system(
+                        f"🏆 Итоги недели!\n\n"
+                        f"Победитель — {top1['display_name']}, нафармил {top1['robux']} R$ "
+                        f"и забирает +{top1['prize']} R$ бонусом 🎁\n\n"
+                        f"💡 Это мог бы быть ты, если бы фармил с RoBeggr."
+                    )
+        except Exception as e:
+            print(f"[weekly] watcher error: {e}")
+
+threading.Thread(target=_weekly_watcher, daemon=True, name="weekly-watcher").start()
+
+
+# ── Streak warning watcher ───────────────────────────────────────────────────
+# Reminds users with active streaks who haven't farmed today, before midnight MSK.
+
+def _streak_warning_watcher():
+    import datetime
+    MSK = datetime.timezone(datetime.timedelta(hours=3))
+    while True:
+        time.sleep(900)  # 15 min
+        try:
+            now_msk = datetime.datetime.fromtimestamp(time.time(), tz=MSK)
+            # Send warnings only between 21:00 and 23:30 MSK
+            if not (21 <= now_msk.hour <= 23):
+                continue
+            today_num = int((time.time() + 10800) / 86400)
+            users_at_risk = db_v2.get_users_at_risk_streak(today_num, min_streak=3)
+            for u in users_at_risk:
+                # Time until next MSK midnight
+                total_min = max(0, (24 - now_msk.hour) * 60 - now_msk.minute)
+                hours_left = total_min // 60
+                minutes_left = total_min % 60
+                if hours_left > 0:
+                    time_left = f"{hours_left}ч {minutes_left:02d}м"
+                else:
+                    time_left = f"{minutes_left} мин"
+
+                streak = u["streak"]
+                streak_word = _streak_word(streak)
+                lines = [
+                    f"🔥 <b>Не забудь зайти сегодня!</b>",
+                    "",
+                    f"У тебя серия из <b>{streak} {streak_word}</b>. Если сегодня не зафармишь — серия сгорит и придётся начинать с нуля.",
+                ]
+                if u["next_milestone"]:
+                    days_to_go = u["next_milestone"] - streak
+                    if days_to_go > 0:
+                        lines.append("")
+                        lines.append(f"🎁 Через <b>{days_to_go} {_day_word(days_to_go)}</b> получишь награду <b>+{u['next_reward']} R$</b>.")
+                lines += ["", f"⏰ До конца дня по МСК: <b>{time_left}</b>"]
+                _send_tg(u["tg_id"], "\n".join(lines))
+                db_v2.mark_streak_warned(u["tg_id"])
+        except Exception as e:
+            print(f"[streak-watcher] error: {e}")
+
+
+def _streak_word(n: int) -> str:
+    """Pluralization for 'дней'."""
+    n = abs(n) % 100
+    if 11 <= n <= 14: return "дней"
+    n = n % 10
+    if n == 1: return "день"
+    if 2 <= n <= 4: return "дня"
+    return "дней"
+
+
+def _day_word(n: int) -> str:
+    return _streak_word(n)
+
+
+threading.Thread(target=_streak_warning_watcher, daemon=True, name="streak-warning").start()
+
+
+# ── Memory cleanup watcher ──────────────────────────────────────────────────
+# Periodically purges expired entries from in-memory dicts to prevent slow leaks.
+
+def _memory_cleanup_watcher():
+    while True:
+        time.sleep(600)  # every 10 min
+        try:
+            now = time.time()
+            # _stokens / _stokens_ga — drop tokens older than 1 hour
+            with _stokens_lock if "_stokens_lock" in globals() else threading.Lock():
+                pass
+            try:
+                cutoff = now - 3600
+                for d in (_stokens, _stokens_ga):
+                    for k in list(d.keys()):
+                        # values are tokens — we don't track timestamps, so drop if dict is huge
+                        pass
+                # When dicts grow too big, just clear oldest half (simpler than tracking ts)
+                for d in (_stokens, _stokens_ga):
+                    if len(d) > 10000:
+                        keys = list(d.keys())[:len(d) // 2]
+                        for k in keys:
+                            d.pop(k, None)
+            except Exception:
+                pass
+
+            # _avatar_upload_log
+            with _avatar_upload_lock:
+                for k in list(_avatar_upload_log.keys()):
+                    if not _avatar_upload_log[k] or now - max(_avatar_upload_log[k]) > 7200:
+                        del _avatar_upload_log[k]
+
+            # _webapp_rl
+            with _webapp_rl_lock:
+                for k in list(_webapp_rl.keys()):
+                    if not _webapp_rl[k] or now - max(_webapp_rl[k]) > _WEBAPP_RL_WINDOW * 2:
+                        del _webapp_rl[k]
+        except Exception as e:
+            print(f"[memcleanup] {e}")
+
+
+threading.Thread(target=_memory_cleanup_watcher, daemon=True, name="mem-cleanup").start()
 
 
 # ── Export endpoints ──────────────────────────────────────────────────

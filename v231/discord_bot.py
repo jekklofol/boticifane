@@ -945,6 +945,102 @@ async def admin_setup(interaction: discord.Interaction):
 bot.tree.add_command(admin_group)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GAMIFICATION: /profile /top /level /setnick
+# ══════════════════════════════════════════════════════════════════════════════
+
+MINIAPP_URL = API_BASE_URL.rstrip("/") + "/miniapp"
+
+def _bar(pct: int, length: int = 10) -> str:
+    return "█" * round(pct / 100 * length) + "░" * (length - round(pct / 100 * length))
+
+
+@bot.tree.command(name="profile", description="Твой профиль — уровень, статистика, ранг", guild=GUILD_OBJ)
+async def dc_cmd_profile(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    p = db_v2.get_webapp_profile(dc_id=interaction.user.id)
+    if not p:
+        await interaction.followup.send("❌ У тебя нет активной лицензии.", ephemeral=True)
+        return
+    bar = _bar(p["progress_pct"])
+    embed = discord.Embed(
+        title=f"{p['tier_emoji']} {p['display_name']}",
+        color=0x7c3aed,
+    )
+    embed.add_field(name="⚡ Уровень", value=f"Lv **{p['level']}** — {p['tier']}\n{bar} {p['progress_pct']}%", inline=False)
+    embed.add_field(name="💰 Robux", value=f"Всего: **{p['total_robux']:,}**\nЭта неделя: **{p['week_robux']:,}**", inline=True)
+    embed.add_field(name="🎯 Статистика", value=f"Донатов: **{p['total_donations']:,}**\nКонверсия: **{p['conversion_pct']}%**", inline=True)
+    if p["week_rank"] > 0:
+        embed.add_field(name="🏆 Место в топе", value=f"**#{p['week_rank']}** на этой неделе", inline=False)
+    embed.set_footer(text=f"Lv {p['level']+1} через {p['xp_needed']-p['xp_in_level']} R$")
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="🌐 Открыть профиль", url=MINIAPP_URL, style=discord.ButtonStyle.link))
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="top", description="Топ фармеров этой недели", guild=GUILD_OBJ)
+async def dc_cmd_top(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    rows = db_v2.get_weekly_leaderboard(limit=10)
+    if not rows:
+        await interaction.followup.send("📭 Топ пока пуст.", ephemeral=True)
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for r in rows[:10]:
+        medal = medals[r["rank_pos"] - 1] if r["rank_pos"] <= 3 else f"#{r['rank_pos']}"
+        lines.append(f"{medal} **{r['display_name']}** — {r['robux_week']:,} R$")
+    import datetime
+    week_ends = db_v2.get_week_start() + 7 * 86400
+    ends_str = datetime.datetime.utcfromtimestamp(week_ends).strftime("%d.%m %H:%M UTC")
+    embed = discord.Embed(title="🏆 Топ фармеров недели", description="\n".join(lines), color=0xf59e0b)
+    embed.add_field(name="🎁 Призы", value="Топ-1: +100 R$\nТоп 2–5: +25 R$ каждому", inline=True)
+    embed.add_field(name="⏰ Сброс", value=ends_str, inline=True)
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="📊 Полный топ", url=MINIAPP_URL, style=discord.ButtonStyle.link))
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="level", description="Твой уровень и что он открывает", guild=GUILD_OBJ)
+async def dc_cmd_level(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    p = db_v2.get_webapp_profile(dc_id=interaction.user.id)
+    if not p:
+        await interaction.followup.send("❌ Нет активной лицензии.", ephemeral=True)
+        return
+    tiers = db_v2.get_all_tiers()
+    cur_tier = next((t for t in tiers if t["min_level"] <= p["level"] <= t["max_level"]), None)
+    next_tier = next((t for t in tiers if t["min_level"] > p["level"]), None)
+    bar = _bar(p["progress_pct"])
+    embed = discord.Embed(
+        title=f"⚡ Уровень {p['level']} — {p['tier']}",
+        description=f"{bar} {p['progress_pct']}%\nДо Lv {p['level']+1}: **{p['xp_needed']-p['xp_in_level']}** R$",
+        color=0xa855f7,
+    )
+    if cur_tier:
+        embed.add_field(name="🔓 Разблокировано", value="\n".join(cur_tier["perks"]), inline=False)
+    if next_tier:
+        embed.add_field(
+            name=f"⬆️ Следующий тир: {next_tier['emoji']} {next_tier['name']} (Lv {next_tier['min_level']})",
+            value="\n".join(f"🔒 {p}" for p in next_tier["perks"]),
+            inline=False,
+        )
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="🗺 Карта уровней", url=MINIAPP_URL, style=discord.ButtonStyle.link))
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="setnick", description="Установить ник в боте", guild=GUILD_OBJ)
+@app_commands.describe(nickname="Твой ник (до 24 символов)")
+async def dc_cmd_setnick(interaction: discord.Interaction, nickname: str):
+    nick = nickname.strip()[:24]
+    if len(nick) < 1:
+        await interaction.response.send_message("Ник слишком короткий.", ephemeral=True)
+        return
+    db_v2.dc_set_nickname(interaction.user.id, nick)
+    await interaction.response.send_message(f"✅ Ник установлен: **{nick}**", ephemeral=True)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def main():
