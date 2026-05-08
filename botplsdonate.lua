@@ -409,6 +409,15 @@ local leavingSoon   = false
 local lastCongratTs = 0
 -- Donors to thank after 2-3 min: { [name] = {ts, thanked} }
 local recentDonors  = {}
+-- Persistent donors (survive hops): { [name] = true }, loaded from file
+local persistentDonors = {}
+local DONORS_PATH = "pd_donors_" .. tostring(player and player.UserId or "0") .. ".json"
+-- Ignore decay: ignoreList stores tick() timestamps; entries older than this are auto-removed
+local IGNORE_DECAY_SECS = math.random(720, 900)  -- 12-15 min, random per session
+-- Booth visitor queue: background monitor sets this so nextPlayer() can greet them
+local boothVisitorTarget = nil
+-- Soft follow-up queue: { [userId] = {name, sendAfter} }
+local pendingFollowUps = {}
 
 -- ==================== STATISTICS ====================
 local Stats = {
@@ -2488,10 +2497,18 @@ local function chasePlayer(t)
     if not h or not r then return false end
     log("[CHASE] Going to " .. t.Name .. " (approaching from front)")
 
+    -- Bezier curve: go through a slightly offset midpoint so path isn't a straight line
+    local targetHRP0 = t.Character:FindFirstChild("HumanoidRootPart")
+    if targetHRP0 and (r.Position - targetHRP0.Position).Magnitude > 15 then
+        local mx = (r.Position.X + targetHRP0.Position.X) / 2 + math.random(-4, 4)
+        local mz = (r.Position.Z + targetHRP0.Position.Z) / 2 + math.random(-4, 4)
+        h:MoveTo(Vector3.new(mx, r.Position.Y, mz))
+        task.wait(0.35)
+    end
+
     local function safeGetPos()
         local targetHRP = t.Character and t.Character:FindFirstChild("HumanoidRootPart")
         if not targetHRP then return nil end
-        -- Aim for a position 4 studs in front of the target's face
         return targetHRP.Position + targetHRP.CFrame.LookVector * 4
     end
 
@@ -2691,17 +2708,69 @@ local function sendChatTyped(msg)
     sendChat(msg)
 end
 
+-- Send a Roblox /e emote (non-blocking)
+local function sendEmote(emoteName)
+    if SILENT_MODE then return end
+    task.spawn(function()
+        if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+            local ch = TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+            if ch then pcall(function() ch:SendAsync("/e " .. emoteName) end) end
+        end
+        local say = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+                    and ReplicatedStorage.DefaultChatSystemChatEvents:FindFirstChild("SayMessageRequest")
+        if say then pcall(function() say:FireServer("/e " .. emoteName, "All") end) end
+    end)
+end
+
+-- Load/save donor list from disk so we recognise returning donors across hops
+local function loadPersistentDonors()
+    local _rf = rawget(getfenv(), "readfile") or (syn and syn.readfile)
+    if not _rf then return end
+    local ok, content = pcall(_rf, DONORS_PATH)
+    if ok and content and #content > 2 then
+        local ok2, data = pcall(function()
+            return HttpService:JSONDecode(content)
+        end)
+        if ok2 and type(data) == "table" then
+            persistentDonors = data
+            local n = 0; for _ in pairs(data) do n += 1 end
+            log("[DONORS] Loaded " .. n .. " known donors from disk")
+        end
+    end
+end
+local function savePersistentDonors()
+    local _wf = rawget(getfenv(), "writefile") or (syn and syn.writefile)
+    if not _wf then return end
+    local ok, data = pcall(function() return HttpService:JSONEncode(persistentDonors) end)
+    if ok then pcall(_wf, DONORS_PATH, data) end
+end
+
 -- Occasional natural movement between targets (no dance)
 local function doIdleAction()
     local roll = math.random()
-    if roll < 0.12 then
+    if roll < 0.10 then
         -- short jump
         VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
         task.wait(0.3)
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-    elseif roll < 0.18 then
+    elseif roll < 0.16 then
         -- brief pause
         task.wait(math.random() * 0.8 + 0.3)
+    elseif roll < 0.22 then
+        -- browse nearby booth area like a regular player exploring
+        task.spawn(function()
+            if not player.Character then return end
+            local h2 = player.Character:FindFirstChild("Humanoid")
+            if not h2 then return end
+            local wander = Vector3.new(
+                BOOTH_CHECK_POSITION.X + math.random(-28, 28),
+                BOOTH_CHECK_POSITION.Y,
+                BOOTH_CHECK_POSITION.Z + math.random(-28, 28)
+            )
+            log("[IDLE] Browsing booth area")
+            h2:MoveTo(wander)
+            task.wait(math.random(3, 8) + math.random())
+        end)
     end
 end
 
@@ -2800,6 +2869,14 @@ local function findClosest()
             end
         end
         mentionQueue[uid] = nil  -- player left, clean up
+    end
+
+    -- Decay: remove stale ignoreList entries (12-15 min old)
+    local nowTick = tick()
+    for uid, ts in pairs(ignoreList) do
+        if type(ts) == "number" and (nowTick - ts) > IGNORE_DECAY_SECS then
+            ignoreList[uid] = nil
+        end
     end
 
     -- Normal: closest player not in ignoreList
@@ -3003,7 +3080,34 @@ local function getFirstMsg(t)
 end
 
 -- ========= MAIN LOGIC WITH CHAT RESPONSE =========
+local JUST_GREETINGS = {
+    "heyy :)", "hi!", "hey hey", "hii", "heyyy", "hi there :)", "hey!",
+}
+local DONOR_GREETS = {
+    "oh hey!! u donated before right??",
+    "omg hey!! i remember u :)",
+    "heyy!! didnt u tip me before?? ty so much!!",
+    "ooh i think u donated before!! ty :))",
+}
+local BOOTH_GREETS = {
+    "oh hey!! checking out my booth? :)",
+    "heyy!! u looking at my stuff?",
+    "oh hi!! thanks for stopping by :))",
+    "hey!! u interested? :)",
+}
+
 local function nextPlayer()
+    -- Priority: someone visited our booth while we were away
+    if boothVisitorTarget then
+        local visitor = boothVisitorTarget
+        boothVisitorTarget = nil
+        if visitor.Character and visitor.Character:FindFirstChild("HumanoidRootPart")
+           and not ignoreList[visitor.UserId] then
+            mentionQueue[visitor.UserId] = true
+            log("[BOOTH] Booth visitor queued: " .. visitor.Name)
+        end
+    end
+
     local target = findClosest()
     if not target then
         log("[MAIN] Everyone greeted — going home")
@@ -3011,12 +3115,42 @@ local function nextPlayer()
         return false
     end
 
+    -- "Just noticed you" delay — bot doesn't react instantly
+    task.wait(math.random(3, 18) / 10)
+
     log("[MAIN] Target → " .. target.Name)
-    lastActivityTime = tick()  -- bot is actively working
+    lastActivityTime = tick()
 
     doIdleAction()
 
+    local isBooth = (mentionQueue[target.UserId] == nil
+        and boothVisitorTarget == nil
+        and (player.Character and player.Character:FindFirstChild("HumanoidRootPart"))
+        and (target.Character and target.Character:FindFirstChild("HumanoidRootPart"))
+        and (player.Character.HumanoidRootPart.Position - HOME_POSITION).Magnitude < 15
+        and (target.Character.HumanoidRootPart.Position - HOME_POSITION).Magnitude < 12)
+
     if chasePlayer(target) then
+        -- 30% chance: /e wave when first approaching
+        if math.random(10) <= 3 then
+            sendEmote("wave")
+            task.wait(math.random(5, 12) / 10)
+        end
+
+        if isBooth then
+            -- Greeted at our own booth
+            sendChatTyped(BOOTH_GREETS[math.random(#BOOTH_GREETS)])
+            task.wait(math.random() * 0.5 + 0.8)
+        elseif persistentDonors[target.Name] then
+            -- Known donor from previous session
+            sendChatTyped(DONOR_GREETS[math.random(#DONOR_GREETS)])
+            task.wait(math.random() * 0.5 + 0.8)
+        elseif math.random(5) == 1 then
+            -- 20% chance: pure greeting first, ask after 5-10s
+            sendChatTyped(JUST_GREETINGS[math.random(#JUST_GREETINGS)])
+            task.wait(math.random(5, 10) + math.random())
+        end
+
         -- Compliment first, then donation ask that naturally follows (no re-greeting)
         local compliment = COMPLIMENTS[math.random(#COMPLIMENTS)]
         sendChatTyped(compliment)
@@ -3187,7 +3321,7 @@ local function nextPlayer()
             end)
             returnHome()
             sendChat(MSG_HERE_IS_HOUSE)
-            ignoreList[target.UserId] = true
+            ignoreList[target.UserId] = tick()
             Stats.agreed += 1
             refusalStreak = 0
             logInteraction(target.Name, openingMsg, playerReply, "agreed")
@@ -3218,7 +3352,7 @@ local function nextPlayer()
                 sendChatTyped(MSGS_GOODBYE[math.random(#MSGS_GOODBYE)])
             end
 
-            ignoreList[target.UserId] = true
+            ignoreList[target.UserId] = tick()
             Stats.refused += 1
             refusalStreak += 1
             if refusalStreak >= FRUSTRATION_THRESHOLD then
@@ -3239,11 +3373,18 @@ local function nextPlayer()
                 sendChatTyped(MSGS_GOODBYE[math.random(#MSGS_GOODBYE)])
             end
             log("[WAIT] No valid reply from " .. target.Name .. " — moving on")
-            ignoreList[target.UserId] = true
+            ignoreList[target.UserId] = tick()
             Stats.no_response += 1
             refusalStreak += 1
             logInteraction(target.Name, openingMsg, "",
                 result == "left" and "left" or "no_response")
+            -- Soft follow-up: if they didn't physically leave, try again in 3-4 min
+            if result ~= "left" then
+                pendingFollowUps[target.UserId] = {
+                    name      = target.Name,
+                    sendAfter = tick() + math.random(180, 240),
+                }
+            end
             if refusalStreak >= FRUSTRATION_THRESHOLD then
                 task.wait(1)
                 sendChat(FRUSTRATION_MSGS[math.random(#FRUSTRATION_MSGS)])
@@ -3253,7 +3394,7 @@ local function nextPlayer()
     else
         -- Chase failed (player moved away / unreachable)
         logInteraction(target.Name, "", "", "chase_fail")
-        ignoreList[target.UserId] = true
+        ignoreList[target.UserId] = tick()
     end
 
     task.wait(1)
@@ -3452,6 +3593,14 @@ local function onDonation(delta, source)
     log(string.format(
         "[DONATE/%s] +R$%d | Session total: R$%d gross / R$%d net | %d donations",
         source, delta, Stats.robux_gross, math.floor(Stats.robux_gross * 0.6), Stats.donations))
+    -- Celebrate with random dance emote (60% chance)
+    if math.random(10) <= 6 then
+        local dances = {"dance", "dance2", "dance3", "cheer", "wave"}
+        task.spawn(function()
+            task.wait(math.random(5, 15) / 10)
+            sendEmote(dances[math.random(#dances)])
+        end)
+    end
 end
 
 local function monitorDonations()
@@ -3501,6 +3650,11 @@ local function monitorDonations()
                     onDonation(amt, "CDA:" .. tipName)
                     -- Queue for deferred thank-you approach (2–3 min later)
                     recentDonors[tipName] = {ts = os.time(), thanked = false}
+                    -- Remember this donor persistently across hops
+                    if not persistentDonors[tipName] then
+                        persistentDonors[tipName] = true
+                        pcall(savePersistentDonors)
+                    end
                 else
                     -- Someone else received a donation — react with congrats (max once/30s)
                     local now = os.time()
@@ -3514,7 +3668,7 @@ local function monitorDonations()
                             "love to see it!! 🎉",
                         }
                         task.spawn(function()
-                            task.wait(math.random(5, 20) / 10)
+                            task.wait(math.random(10, 40) / 10)  -- 1-4s delay, not instant
                             sendChat(CONGRATS[math.random(#CONGRATS)])
                         end)
                     end
@@ -3678,6 +3832,62 @@ end
 
 monitorDonations()
 startReporting()
+loadPersistentDonors()
+
+-- Booth visitor monitor: if someone stands near our booth, queue them as priority
+task.spawn(function()
+    task.wait(45)  -- wait for booth to be claimed first
+    while isActiveInstance() do
+        task.wait(6)
+        if not isActiveInstance() then break end
+        pcall(function()
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= player and not BOT_ACCOUNTS[p.Name] and not ignoreList[p.UserId]
+                   and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    local dist = (p.Character.HumanoidRootPart.Position - HOME_POSITION).Magnitude
+                    if dist < 12 and not mentionQueue[p.UserId] then
+                        boothVisitorTarget = p
+                        log("[BOOTH] Visitor near booth: " .. p.Name)
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+-- Soft follow-up daemon: re-approach no-response players 3-4 min later
+task.spawn(function()
+    local FOLLOWUP_MSGS = {
+        "heyy did u see my msg lol",
+        "still here if u change ur mind :)",
+        "just in case u missed it — spare some robux?",
+        "hey no pressure but still asking lol",
+        "lmk if u change ur mind :))",
+        "heyy u still there? just asking once more",
+    }
+    while isActiveInstance() do
+        task.wait(20)
+        if not isActiveInstance() then break end
+        local nowT = tick()
+        for uid, info in pairs(pendingFollowUps) do
+            if nowT >= info.sendAfter then
+                pendingFollowUps[uid] = nil
+                local still = nil
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p.UserId == uid then still = p; break end
+                end
+                if still and still.Character and still.Character:FindFirstChild("HumanoidRootPart")
+                   and not ignoreList[uid] then
+                    log("[FOLLOWUP] Sending follow-up to " .. info.name)
+                    task.spawn(function()
+                        sendChatTyped(FOLLOWUP_MSGS[math.random(#FOLLOWUP_MSGS)])
+                        ignoreList[uid] = tick()
+                    end)
+                end
+            end
+        end
+    end
+end)
 
 -- ── Watchdog: if bot hasn't actually begged in N minutes, force server hop ──
 -- Hop interval randomised per-bot (8-15 min) so 50 bots aren't all hopping
@@ -3699,6 +3909,21 @@ task.spawn(function()
             leavingSoon = false
             log(string.format("[WATCHDOG] No begging for %.0fs — force hopping!", sinceLastBeg))
             serverHop(true)
+        end
+        -- Extra hop: everyone on server already ignored (nowhere to go)
+        if sinceLastBeg > 90 then
+            local total, ignored = 0, 0
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= player then
+                    total += 1
+                    if ignoreList[p.UserId] or BOT_ACCOUNTS[p.Name] then ignored += 1 end
+                end
+            end
+            if total > 0 and ignored >= total then
+                leavingSoon = false
+                log("[WATCHDOG] Everyone on server exhausted — hopping early")
+                serverHop(true)
+            end
         end
     end
     log("[SINGLETON] Watchdog exiting (new instance took over)")
