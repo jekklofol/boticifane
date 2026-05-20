@@ -145,6 +145,54 @@ local MESSAGE_TYPOS_EXTRA = {
     {"any donations? pls", "any donatioms? pls", "any donations? pld"},
 }
 
+-- ========= ADVERTISEMENT MESSAGES =========
+-- Chance to send an ad instead of a beg message. Keep low to look organic.
+local AD_CHANCE = 0.05
+-- Domain written in many ways to slip past Roblox URL filter. Mix of:
+--   * "dot" word                 (adoptme dot pw)
+--   * comma instead of dot       (adoptme,pw)
+--   * space before dot           (adoptme .pw)
+--   * fused into one word        (adoptmepw)
+--   * no dot at all              (search adoptme pw)
+-- humanize() will NOT apply typo mutations to these (would break the domain).
+local AD_MESSAGES = {
+    -- contextual (sounds like a player tip)
+    "btw i check pet values on adoptme dot pw",
+    "i use adoptme,pw for trade calc fr",
+    "saving robux for adopt me, adoptmepw helped me trade",
+    "any adopt me players here? adoptme pw has all values",
+    "trading pets? google adoptme pw",
+    "last trade i used adoptmepw to check worth",
+    "if u play adopt me adoptme,pw has wfl calc",
+    "ngl adoptme dot pw way cleaner than amvgg",
+    "checked my pet on adoptmepw worth like 200k",
+    "adoptme dot pw better than elvebredd ngl",
+    "i grind robux here for adopt me, adoptmepw for values",
+    "yo if u trade pets check adoptme dot pw",
+    "adoptmepw has the best wfl calc",
+    "my friend told me adoptme .pw the new amv site",
+    "adoptmepw values way more accurate fr",
+    -- direct (short tip)
+    "yall use adoptme dot pw for am values",
+    "check adoptme,pw if u trade pets",
+    "adoptmepw best calc rn",
+    "go adoptme pw new vlist site",
+    "adoptme dot pw is goated",
+    "search adoptme pw on google am values",
+    "adoptme,pw wfl calc is fire",
+    "use adoptme .pw for trading",
+    "type adoptme pw in browser amv site",
+    "new amv site adoptmepw",
+    -- short casual
+    "adoptme dot pw fr",
+    "go adoptmepw",
+    "amv? adoptme pw",
+    "vlist: adoptme pw",
+    "use adoptme,pw",
+    "adoptmepw is the move",
+    "adoptme dot pw 🔥",
+}
+
 local WAIT_FOR_ANSWER_TIME = 7        -- seconds to wait for reply
 local MAX_WAIT_DISTANCE = 10              -- max distance before following player while waiting
 -- YES: full words or substrings for longer phrases
@@ -2653,10 +2701,19 @@ local function maybeEmoji(s)
     return s
 end
 
+local function isAdMessage(msg)
+    return type(msg) == "string" and msg:lower():find("adoptme", 1, true) ~= nil
+end
+
 local function humanize(msg)
     if type(msg) ~= "string" or msg == "" then return msg end
     local out = msg
-    out = maybeTypo(out)
+    -- Ad messages contain a domain mention — typo mutation would corrupt it
+    -- and the filter would no longer recognise nothing... it would still pass,
+    -- but the URL becomes useless to the reader. Skip typo for ads only.
+    if not isAdMessage(out) then
+        out = maybeTypo(out)
+    end
     out = maybeLower(out)
     out = maybeDropPunc(out)
     out = maybeEllipsis(out)
@@ -2908,6 +2965,10 @@ end
 -- Forward decl: real definition is in BEG PHRASE COMBINATOR section below.
 local genBegPhrase
 local function getRandomMessage()
+    -- Small chance to drop an ad for the value-list site instead of a beg.
+    if math.random() < AD_CHANCE then
+        return AD_MESSAGES[math.random(#AD_MESSAGES)]
+    end
     -- 50% generated on the fly via combinator (unique strings every time),
     -- 50% from the static MESSAGES pool (with original typo variants).
     if math.random() < 0.5 then
